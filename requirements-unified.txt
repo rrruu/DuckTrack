@@ -1,0 +1,7 @@
+pynput
+pyautogui
+Pillow
+mss
+screeninfo
+fastapi
+uvicorn

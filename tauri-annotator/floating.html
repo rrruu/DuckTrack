@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DuckTrack 控制</title>
+    <style>
+      html, body {
+        margin: 0; padding: 0;
+        background: rgba(30, 32, 46, 0.95);
+        color: #f5f7ff;
+        font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        user-select: none; overflow: hidden;
+      }
+      #app { box-sizing: border-box; width: 100vw; height: 100vh; padding: 10px 12px; }
+      .loading-hint { font-size: 12px; color: #cfd6ff; }
+    </style>
+  </head>
+  <body>
+    <div id="app"><span class="loading-hint">加载中…</span></div>
+    <script type="module" src="/src/floating.ts"></script>
+  </body>
+</html>
