@@ -145,6 +145,8 @@ class CloudSessionStore:
             with urllib.request.urlopen(request, timeout=1800) as response:
                 result = json.loads(response.read().decode("utf-8"))
             annotated = result.get("trajectory", result)
+            if isinstance(annotated, dict):
+                self._maybe_split_subtasks(recording, annotated)
             output = recording / "trajectory.annotated.json"
             output.write_text(json.dumps(annotated, ensure_ascii=False, indent=2), encoding="utf-8")
             self.write_status(session_id, annotation_state="completed", annotation_file="trajectory.annotated.json")
@@ -186,6 +188,8 @@ class CloudSessionStore:
                 )
 
             annotated = self.qwen.annotate_trajectory(recording, update_progress)
+            # Preserve Feature-1 sub_tasks if the annotator payload already has them.
+            self._maybe_split_subtasks(recording, annotated)
             output = recording / "trajectory.annotated.json"
             output.write_text(json.dumps(annotated, ensure_ascii=False, indent=2), encoding="utf-8")
             metadata = annotated.get("annotation_metadata", {})
@@ -205,6 +209,29 @@ class CloudSessionStore:
                 annotation_state="failed",
                 annotation_error=f"{type(exc).__name__}: {exc}",
             )
+
+    def _maybe_split_subtasks(self, recording: Path, annotated: dict) -> None:
+        """Feature-2 placeholder: auto split after step annotation when no manual boundaries.
+
+        Current behavior: ensure sub_tasks from the original trajectory.json are retained
+        on the annotated payload when the step annotator did not drop them.
+        """
+        if not isinstance(annotated, dict):
+            return
+        if annotated.get("sub_tasks"):
+            return
+        source_path = recording / "trajectory.json"
+        if not source_path.is_file():
+            return
+        try:
+            original = json.loads(source_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(original.get("sub_tasks"), list):
+            annotated["sub_tasks"] = original.get("sub_tasks")
+        if isinstance(original.get("sub_task_metadata"), dict):
+            annotated["sub_task_metadata"] = original.get("sub_task_metadata")
+        # TODO(feature-2): if manual_boundary_count == 0, run subtask_splitter here.
 
     def resume_pending_annotations(self):
         for status_path in self.root.glob("*/cloud_status.json"):

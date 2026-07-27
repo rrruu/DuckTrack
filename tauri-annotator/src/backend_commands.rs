@@ -929,6 +929,25 @@ pub async fn backend_resume_recording() -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn backend_mark_sub_task_boundary(instruction: Option<String>) -> Result<Value, String> {
+  let payload = Some(serde_json::json!({
+    "instruction": instruction.unwrap_or_default(),
+  }));
+  tauri::async_runtime::spawn_blocking(move || {
+    backend_post_json("/api/recordings/sub_task_boundary", payload)
+  })
+  .await
+  .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn backend_get_sub_task_state() -> Result<Value, String> {
+  tauri::async_runtime::spawn_blocking(|| backend_get("/api/recordings/sub_task_state"))
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn backend_stop_recording() -> Result<String, String> {
   let data = tauri::async_runtime::spawn_blocking(|| backend_post("/api/recordings/stop"))
     .await

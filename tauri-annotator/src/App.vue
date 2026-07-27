@@ -15,17 +15,39 @@
         返回工作流
       </button>
       <div v-if="enteredAnnotator" class="sidebar-steps">
-        <div class="sidebar-section-label">步骤列表</div>
-        <div class="step-list">
-          <div
-            v-for="(idx, viewIdx) in filteredIndices"
-            :key="idx"
-            class="step-item"
-            :class="{ active: viewIdx === selectedViewIndex }"
-            @click="selectViewIndex(viewIdx)"
+        <div class="sidebar-section-label">子任务 / 步骤</div>
+        <div class="subtask-toolbar">
+          <button
+            class="btn"
+            type="button"
+            disabled
+            title="后续版本：上传云端后由模型自动划分"
           >
-            {{ formatStepLabel(steps[idx]) }}
-          </div>
+            模型划分子任务
+          </button>
+        </div>
+        <div class="step-list">
+          <template v-for="group in sidebarGroups" :key="group.key">
+            <div
+              class="subtask-group-header"
+              :class="{ active: group.subTask && selectedSubTaskId === group.subTask.id }"
+              @click="group.subTask && selectSubTask(group.subTask.id)"
+            >
+              <span class="subtask-group-title">{{ group.title }}</span>
+              <span class="subtask-group-range" v-if="group.subTask">
+                步骤 {{ group.subTask.start_step }}–{{ group.subTask.end_step }}
+              </span>
+            </div>
+            <div
+              v-for="entry in group.entries"
+              :key="entry.idx"
+              class="step-item"
+              :class="{ active: entry.viewIdx === selectedViewIndex }"
+              @click="selectViewIndex(entry.viewIdx)"
+            >
+              {{ formatStepLabel(steps[entry.idx]) }}
+            </div>
+          </template>
         </div>
       </div>
       <p v-else class="sidebar-hint">加载录制目录后，在右侧完成标注与保存。</p>
@@ -246,6 +268,28 @@
         </div>
 
         <div class="instruction-card">
+          <div class="panel-title small">SUB-TASK</div>
+          <div class="subtask-edit" v-if="selectedSubTask">
+            <label class="annotation-field wide">
+              <span>子任务意图 (instruction)</span>
+              <input v-model="selectedSubTaskInstruction" placeholder="填写该段操作意图" />
+            </label>
+            <div class="subtask-meta">
+              #{{ (selectedSubTask.index ?? 0) + 1 }} ·
+              source={{ selectedSubTask.source || "manual" }} ·
+              步骤 {{ selectedSubTask.start_step }}–{{ selectedSubTask.end_step }}
+            </div>
+            <div class="subtask-actions">
+              <button class="btn" type="button" @click="splitSubTaskAtSelected" :disabled="!canSplitAtSelected">
+                从此步拆分子任务
+              </button>
+              <button class="btn" type="button" @click="mergeSelectedSubTaskWithPrev" :disabled="!canMergeSelectedSubTask">
+                与上一段合并
+              </button>
+            </div>
+          </div>
+          <div v-else class="subtask-empty">当前无子任务信息（旧录制可保存后自动补全单段）。</div>
+
           <div class="panel-title small">STEP INSTRUCTION</div>
           <div v-if="canDeleteSelected" class="wait-review-row">
             <span class="wait-tip">
@@ -434,10 +478,67 @@ const recordingName = computed(() => {
 const trajectoryData = ref<any>(null);
 const screenshotFrameMode = ref<"before" | "after" | "settled">("before");
 const steps = computed<Step[]>(() => trajectoryData.value?.trajectory || []);
+const subTasks = computed<any[]>(() =>
+  Array.isArray(trajectoryData.value?.sub_tasks) ? trajectoryData.value.sub_tasks : []
+);
 
 const filteredIndices = computed(() => {
   const list = steps.value || [];
   return list.map((_, i) => i);
+});
+
+type SidebarGroup = {
+  key: string;
+  title: string;
+  subTask: any | null;
+  entries: Array<{ idx: number; viewIdx: number }>;
+};
+
+const sidebarGroups = computed<SidebarGroup[]>(() => {
+  const indices = filteredIndices.value;
+  const tasks = subTasks.value;
+  if (!tasks.length) {
+    return [
+      {
+        key: "all",
+        title: "全部步骤",
+        subTask: null,
+        entries: indices.map((idx, viewIdx) => ({ idx, viewIdx })),
+      },
+    ];
+  }
+  const groups: SidebarGroup[] = tasks.map((task: any, i: number) => {
+    const titleText = (task.instruction || "").trim() || "（未填写意图）";
+    return {
+      key: task.id || `st_${i}`,
+      title: `子任务 #${(task.index ?? i) + 1}：${titleText}`,
+      subTask: task,
+      entries: [] as Array<{ idx: number; viewIdx: number }>,
+    };
+  });
+  const unmatched: Array<{ idx: number; viewIdx: number }> = [];
+  indices.forEach((idx, viewIdx) => {
+    const step = steps.value[idx];
+    const name = step?.action?.[0]?.name;
+    if (name === "terminate") {
+      unmatched.push({ idx, viewIdx });
+      return;
+    }
+    const group = groups.find(
+      (g) => g.subTask && idx >= g.subTask.start_step && idx <= g.subTask.end_step
+    );
+    if (group) group.entries.push({ idx, viewIdx });
+    else unmatched.push({ idx, viewIdx });
+  });
+  if (unmatched.length) {
+    groups.push({
+      key: "other",
+      title: "其他 / terminate",
+      subTask: null,
+      entries: unmatched,
+    });
+  }
+  return groups;
 });
 
 const selectedViewIndex = ref(0);
@@ -446,6 +547,184 @@ const selectedStep = computed<Step | null>(() => {
   const i = selectedStepIndex.value;
   return steps.value?.[i] || null;
 });
+
+function findSubTaskForStep(stepIndex: number): any | null {
+  for (const task of subTasks.value) {
+    if (stepIndex >= Number(task.start_step) && stepIndex <= Number(task.end_step)) {
+      return task;
+    }
+  }
+  return null;
+}
+
+const selectedSubTask = computed(() => findSubTaskForStep(selectedStepIndex.value));
+const selectedSubTaskId = computed(() => selectedSubTask.value?.id || "");
+
+const selectedSubTaskInstruction = computed<string>({
+  get() {
+    return selectedSubTask.value?.instruction || "";
+  },
+  set(v: string) {
+    const task = selectedSubTask.value;
+    if (!task || !trajectoryData.value) return;
+    task.instruction = v;
+    task.needs_review = !String(v || "").trim();
+    if (!task.source) task.source = "manual";
+    dirty.value = true;
+  },
+});
+
+const canSplitAtSelected = computed(() => {
+  const task = selectedSubTask.value;
+  const idx = selectedStepIndex.value;
+  if (!task) return false;
+  const name = selectedStep.value?.action?.[0]?.name;
+  if (name === "terminate") return false;
+  return idx > Number(task.start_step) && idx <= Number(task.end_step);
+});
+
+const canMergeSelectedSubTask = computed(() => {
+  const task = selectedSubTask.value;
+  if (!task) return false;
+  return Number(task.index) > 0;
+});
+
+function ensureSubTaskDefaults() {
+  if (!trajectoryData.value) return;
+  const list = trajectoryData.value.trajectory;
+  if (!Array.isArray(list)) return;
+  if (!Array.isArray(trajectoryData.value.sub_tasks) || !trajectoryData.value.sub_tasks.length) {
+    let last = -1;
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i]?.action?.[0]?.name !== "terminate") {
+        last = i;
+        break;
+      }
+    }
+    if (last >= 0) {
+      trajectoryData.value.sub_tasks = [
+        {
+          id: `st_${Date.now().toString(16)}`,
+          index: 0,
+          instruction: "",
+          start_step: 0,
+          end_step: last,
+          source: "manual",
+          confidence: null,
+          needs_review: true,
+          model: null,
+          prompt_version: null,
+        },
+      ];
+    } else {
+      trajectoryData.value.sub_tasks = [];
+    }
+  }
+  if (!trajectoryData.value.sub_task_metadata || typeof trajectoryData.value.sub_task_metadata !== "object") {
+    const hasMulti = Array.isArray(trajectoryData.value.sub_tasks) && trajectoryData.value.sub_tasks.length > 1;
+    trajectoryData.value.sub_task_metadata = {
+      status: hasMulti ? "manual_complete" : "none",
+      splitter: hasMulti ? "manual" : "none",
+      manual_boundary_count: hasMulti ? trajectoryData.value.sub_tasks.length - 1 : 0,
+      split_at_unix: null,
+      prompt_version: null,
+      previous_sub_tasks: null,
+    };
+  }
+}
+
+function selectSubTask(id: string) {
+  const task = subTasks.value.find((t) => t.id === id);
+  if (!task) return;
+  const viewIdx = filteredIndices.value.findIndex((idx) => idx === Number(task.start_step));
+  if (viewIdx >= 0) selectViewIndex(viewIdx);
+}
+
+function newSubTaskId(): string {
+  return `st_${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+}
+
+function splitSubTaskAtSelected() {
+  const task = selectedSubTask.value;
+  const idx = selectedStepIndex.value;
+  if (!task || !trajectoryData.value || !canSplitAtSelected.value) return;
+  const list = [...subTasks.value];
+  const pos = list.findIndex((t) => t.id === task.id);
+  if (pos < 0) return;
+  const left = {
+    ...task,
+    end_step: idx - 1,
+    source: "manual",
+    model: null,
+    prompt_version: null,
+  };
+  const right = {
+    id: newSubTaskId(),
+    index: 0,
+    instruction: "",
+    start_step: idx,
+    end_step: Number(task.end_step),
+    source: "manual",
+    confidence: null,
+    needs_review: true,
+    model: null,
+    prompt_version: null,
+  };
+  const next = [...list.slice(0, pos), left, right, ...list.slice(pos + 1)];
+  next.forEach((t, i) => (t.index = i));
+  trajectoryData.value.sub_tasks = next;
+  const meta = trajectoryData.value.sub_task_metadata || {};
+  meta.status = "manual_complete";
+  meta.splitter = "manual";
+  meta.manual_boundary_count = Math.max(Number(meta.manual_boundary_count || 0), next.length - 1);
+  trajectoryData.value.sub_task_metadata = meta;
+  dirty.value = true;
+}
+
+function mergeSelectedSubTaskWithPrev() {
+  const task = selectedSubTask.value;
+  if (!task || !trajectoryData.value || !canMergeSelectedSubTask.value) return;
+  const list = [...subTasks.value];
+  const pos = list.findIndex((t) => t.id === task.id);
+  if (pos <= 0) return;
+  const prev = list[pos - 1];
+  const instruction = (prev.instruction || task.instruction || "").trim();
+  const merged = {
+    ...prev,
+    instruction,
+    end_step: Number(task.end_step),
+    source: "manual",
+    confidence: null,
+    needs_review: !instruction,
+    model: null,
+    prompt_version: null,
+  };
+  const next = [...list.slice(0, pos - 1), merged, ...list.slice(pos + 1)];
+  next.forEach((t, i) => (t.index = i));
+  trajectoryData.value.sub_tasks = next;
+  dirty.value = true;
+}
+
+function rebuildSubTasksAfterDelete(deletedIndex: number) {
+  if (!trajectoryData.value) return;
+  const next: any[] = [];
+  for (const item of subTasks.value) {
+    let start = Number(item.start_step);
+    let end = Number(item.end_step);
+    if (end < deletedIndex) {
+      // unchanged
+    } else if (start > deletedIndex) {
+      start -= 1;
+      end -= 1;
+    } else {
+      end -= 1;
+      if (start > end) continue;
+    }
+    next.push({ ...item, start_step: start, end_step: end });
+  }
+  next.forEach((t, i) => (t.index = i));
+  trajectoryData.value.sub_tasks = next;
+}
 const previewPath = computed(() => {
   if (!recordingPath.value || !selectedStep.value) return "";
   const frames = selectedStep.value.frames || {};
@@ -903,6 +1182,7 @@ function removeCurrentStep() {
   const list = steps.value;
   if (!Array.isArray(list) || idx < 0 || idx >= list.length) return;
   list.splice(idx, 1);
+  rebuildSubTasksAfterDelete(idx);
   dirty.value = true;
   if (selectedViewIndex.value >= filteredIndices.value.length) {
     selectedViewIndex.value = Math.max(0, filteredIndices.value.length - 1);
@@ -1078,6 +1358,7 @@ async function pickRecordingDir() {
     status.value = `读取 trajectory.json...`;
     const trajText: string = await invoke("read_text_file", { path: trajPath });
     trajectoryData.value = JSON.parse(trajText);
+    ensureSubTaskDefaults();
 
     status.value = `查找 mp4...`;
     const foundMp4 = await invoke<string | null>("get_latest_mp4", { dir });
@@ -1489,6 +1770,65 @@ onBeforeUnmount(() => {
   letter-spacing: 0.06em;
   color: var(--text-dim);
   padding: 4px 10px 8px;
+}
+
+.subtask-toolbar {
+  padding: 0 10px 8px;
+}
+
+.subtask-toolbar .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.subtask-group-header {
+  margin: 6px 8px 4px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.subtask-group-header.active {
+  background: rgba(16, 163, 127, 0.18);
+}
+
+.subtask-group-title {
+  font-size: 12px;
+  color: #e5e7eb;
+  font-weight: 600;
+}
+
+.subtask-group-range {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.subtask-edit {
+  margin-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.subtask-meta {
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.subtask-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.subtask-empty {
+  font-size: 12px;
+  color: #9ca3af;
+  margin-bottom: 10px;
 }
 
 .sidebar-steps {

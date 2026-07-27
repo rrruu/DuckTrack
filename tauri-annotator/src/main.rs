@@ -93,7 +93,7 @@ fn show_floating_controls(app: tauri::AppHandle) -> Result<(), String> {
 
   tauri::WebviewWindowBuilder::new(&app, "floating", url)
     .title("DuckTrack 控制")
-    .inner_size(300.0, 120.0)
+    .inner_size(360.0, 190.0)
     .resizable(false)
     .maximizable(false)
     .minimizable(false)
@@ -136,6 +136,8 @@ fn main() {
       backend_commands::backend_start_recording,
       backend_commands::backend_pause_recording,
       backend_commands::backend_resume_recording,
+      backend_commands::backend_mark_sub_task_boundary,
+      backend_commands::backend_get_sub_task_state,
       backend_commands::backend_stop_recording,
       backend_commands::backend_list_recordings,
       backend_commands::cloud_list_sessions,

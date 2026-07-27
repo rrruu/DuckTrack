@@ -16,6 +16,7 @@ from .adaptive_capture import AdaptiveScreenCapture
 from .capture_client import CaptureClient
 from .metadata import MetadataManager
 from .screen_video import ScreenVideoRecorder
+from .subtask_schema import build_covering_sub_tasks, last_actionable_step_index, new_sub_task_id
 from .util import fix_windows_dpi_scaling, get_recordings_dir
 
 
@@ -96,6 +97,12 @@ class Recorder(threading.Thread):
             "left": {"time_stamp": 0.0, "position": None},
             "right": {"time_stamp": 0.0, "position": None}
         }
+
+        # Sub-task segmentation (Feature-1): first segment starts at index 0.
+        self._current_sub_task_id = new_sub_task_id()
+        self._sub_task_index = 0
+        self._manual_boundary_count = 0
+        self._initial_sub_task_id = self._current_sub_task_id
 
         self.mouse_listener = mouse.Listener(
             on_move=self.on_move,
@@ -321,6 +328,7 @@ class Recorder(threading.Thread):
             "scroll",
             "pause",
             "resume",
+            "sub_task_boundary",
         }
 
         if self.save_screenshots and self.obj_dir is not None:
@@ -552,10 +560,31 @@ class Recorder(threading.Thread):
         # merge them into a single continuous scroll action.
         scroll_group_gap_s = 0.25
 
+        # Open sub-task ranges collected while walking events (Feature-1).
+        subtask_ranges = [{
+            "id": self._initial_sub_task_id,
+            "index": 0,
+            "instruction": "",
+            "start_step": 0,
+        }]
+        export_boundary_count = 0
+
         i = 0
         while i < len(events):
             event = events[i]
             action = event.get("action")
+
+            if action == "sub_task_boundary":
+                flush_typing_buffer()
+                export_boundary_count += 1
+                subtask_ranges.append({
+                    "id": event.get("sub_task_id") or new_sub_task_id(),
+                    "index": int(event.get("sub_task_index", len(subtask_ranges))),
+                    "instruction": event.get("instruction") or "",
+                    "start_step": len(trajectory),
+                })
+                i += 1
+                continue
 
             # Merge continuous text input into one "type" action.
             if action == "key_input":
@@ -823,6 +852,25 @@ class Recorder(threading.Thread):
             )
         )
 
+        last_actionable = last_actionable_step_index(trajectory)
+        while len(subtask_ranges) > 1 and int(subtask_ranges[-1].get("start_step", 0)) > last_actionable:
+            subtask_ranges.pop()
+            export_boundary_count = max(0, export_boundary_count - 1)
+
+        if export_boundary_count == 0:
+            boundary_count = 0
+            ranges_for_build = None
+        else:
+            boundary_count = export_boundary_count
+            ranges_for_build = subtask_ranges
+
+        sub_tasks, sub_task_metadata = build_covering_sub_tasks(
+            trajectory,
+            ranges=ranges_for_build,
+            manual_boundary_count=boundary_count,
+            initial_id=self._initial_sub_task_id,
+        )
+
         app_name = "unknown"
         try:
             app_name = platform.node() or "unknown"
@@ -834,12 +882,47 @@ class Recorder(threading.Thread):
             "application": app_name,
             "platform_type": (self.metadata_manager.metadata.get("system", "unknown") or "unknown").lower(),
             "url": None,
+            "sub_tasks": sub_tasks,
+            "sub_task_metadata": sub_task_metadata,
             "trajectory": trajectory,
         }
 
         trajectory_path = os.path.join(self.recording_path, "trajectory.json")
         with open(trajectory_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=4)
+
+    def mark_sub_task_boundary(self, instruction: str = ""):
+        """Start a new sub-task segment from the next recorded actions."""
+        if not self._is_recording:
+            raise RuntimeError("No active recording")
+        if self.last_error:
+            raise RuntimeError(f"Recorder crashed: {self.last_error}")
+        self._sub_task_index += 1
+        self._current_sub_task_id = new_sub_task_id()
+        self._manual_boundary_count += 1
+        text = instruction if isinstance(instruction, str) else ""
+        self._enqueue_event(
+            {
+                "time_stamp": time.perf_counter(),
+                "action": "sub_task_boundary",
+                "sub_task_id": self._current_sub_task_id,
+                "sub_task_index": self._sub_task_index,
+                "instruction": text,
+            },
+            important=True,
+        )
+        return {
+            "sub_task_id": self._current_sub_task_id,
+            "sub_task_index": self._sub_task_index,
+            "manual_boundary_count": self._manual_boundary_count,
+        }
+
+    def get_sub_task_state(self) -> dict:
+        return {
+            "sub_task_id": self._current_sub_task_id,
+            "sub_task_index": self._sub_task_index,
+            "manual_boundary_count": self._manual_boundary_count,
+        }
 
     def pause_recording(self):
         if not self._is_paused and self._is_recording:

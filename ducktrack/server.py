@@ -74,6 +74,27 @@ class RecorderManager:
             raise RuntimeError(f"Recorder finalization failed: {self.recorder.last_error}")
         return path
 
+    def mark_sub_task_boundary(self, instruction: str = ""):
+        if not self.recorder:
+            raise RuntimeError("No active recording")
+        if self.recorder.last_error:
+            raise RuntimeError(f"Recorder crashed: {self.recorder.last_error}")
+        if not self.recorder.is_alive():
+            raise RuntimeError("No active recording")
+        return self.recorder.mark_sub_task_boundary(instruction=instruction or "")
+
+    def sub_task_state(self):
+        if not self.recorder or not self.recorder.is_alive():
+            return {
+                "active": False,
+                "sub_task_id": None,
+                "sub_task_index": 0,
+                "manual_boundary_count": 0,
+            }
+        state = self.recorder.get_sub_task_state()
+        state["active"] = True
+        return state
+
 
 def list_recordings():
     recordings_dir = Path(get_recordings_dir())
@@ -134,6 +155,26 @@ def create_app():
             raise HTTPException(status_code=400, detail=str(exc))
         upload = uploader.enqueue(path)
         return {"recording_path": path, "upload": upload}
+
+    @app.post("/api/recordings/sub_task_boundary")
+    def api_sub_task_boundary(payload: Optional[dict] = None):
+        try:
+            instruction = ""
+            if payload:
+                instruction = payload.get("instruction") or ""
+            result = manager.mark_sub_task_boundary(instruction=instruction)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True, **result}
+
+    @app.get("/api/recordings/sub_task_state")
+    def api_sub_task_state():
+        return manager.sub_task_state()
+
+    @app.post("/api/recordings/{name}/split_subtasks")
+    def api_split_subtasks(name: str):
+        # Feature-2 placeholder
+        raise HTTPException(status_code=501, detail="subtask model split not implemented yet")
 
     @app.get("/api/uploads")
     def api_uploads():
