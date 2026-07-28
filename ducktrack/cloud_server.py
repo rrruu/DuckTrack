@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from .qwen_annotator import QwenAnnotator
+from .subtask_splitter import SubtaskSplitError, SubtaskSplitter
 
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -29,6 +30,7 @@ class CloudSessionStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.annotator_url = os.environ.get("DUCKTRACK_ANNOTATOR_URL", "").strip()
         self.qwen = QwenAnnotator()
+        self.subtask_splitter = SubtaskSplitter()
         self.qwen_concurrency = max(1, int(os.environ.get("DUCKTRACK_QWEN_CONCURRENCY", "1")))
         self._qwen_semaphore = threading.Semaphore(self.qwen_concurrency)
         self.public_base_url = os.environ.get("DUCKTRACK_PUBLIC_BASE_URL", "http://127.0.0.1:18865").rstrip("/")
@@ -36,6 +38,10 @@ class CloudSessionStore:
     @property
     def annotator_configured(self) -> bool:
         return self.qwen.configured or bool(self.annotator_url)
+
+    @property
+    def subtask_splitter_configured(self) -> bool:
+        return self.subtask_splitter.configured
 
     def session_dir(self, session_id: str) -> Path:
         return self.root / _safe_session_id(session_id)
@@ -96,6 +102,49 @@ class CloudSessionStore:
         temp.replace(path)
         self.write_status(session_id, review_state="completed", review_file=path.name)
         return path
+
+    def split_subtasks(self, session_id: str, trajectory: dict | None = None) -> dict:
+        """One-click whole-trajectory sub-task split for a cloud session."""
+        if not self.subtask_splitter_configured:
+            raise HTTPException(
+                status_code=503,
+                detail="未配置划分模型（请设置 DUCKTRACK_QWEN_URL 或 DUCKTRACK_SUBTASK_URL）",
+            )
+        recording = self.session_dir(session_id) / "recording"
+        if not recording.is_dir():
+            raise HTTPException(status_code=404, detail="session recording not found")
+
+        if isinstance(trajectory, dict) and isinstance(trajectory.get("trajectory"), list):
+            import copy
+
+            payload = copy.deepcopy(trajectory)
+            try:
+                updated = self.subtask_splitter.split_trajectory_payload(
+                    payload, response_dir=recording / "model_responses"
+                )
+            except SubtaskSplitError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            # Persist as reviewed so cloud download prefers it
+            path = recording / "trajectory.reviewed.json"
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp.replace(path)
+            raw = recording / "trajectory.json"
+            raw.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.write_status(
+                session_id,
+                subtask_split_state="completed",
+                subtask_split_file=path.name,
+                review_file=path.name,
+            )
+            return updated
+
+        try:
+            updated = self.subtask_splitter.split_recording(recording)
+        except SubtaskSplitError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        self.write_status(session_id, subtask_split_state="completed")
+        return updated
 
     def write_status(self, session_id: str, **updates) -> dict:
         directory = self.session_dir(session_id)
@@ -331,6 +380,19 @@ def create_cloud_app() -> FastAPI:
         threading.Thread(target=store.annotate, args=(session_id,), daemon=True).start()
         return {"session_id": session_id, "state": "queued"}
 
+    @app.post("/api/v1/sessions/{session_id}/split_subtasks")
+    async def split_subtasks(session_id: str, request: Request):
+        authorize(request)
+        trajectory = None
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("trajectory"), list):
+            trajectory = body
+        updated = store.split_subtasks(session_id, trajectory=trajectory)
+        return JSONResponse(updated)
+
     @app.get("/api/v1/sessions/{session_id}/files/{relpath:path}")
     def session_file(session_id: str, relpath: str, request: Request):
         authorize(request)
@@ -347,6 +409,7 @@ def create_cloud_app() -> FastAPI:
         return {
             "status": "ok",
             "annotator_configured": store.annotator_configured,
+            "subtask_splitter_configured": store.subtask_splitter_configured,
             "annotation_provider": "qwen" if store.qwen.configured else (
                 "webhook" if store.annotator_url else None
             ),

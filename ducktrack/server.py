@@ -171,10 +171,51 @@ def create_app():
     def api_sub_task_state():
         return manager.sub_task_state()
 
+    @app.post("/api/trajectory/split_subtasks")
+    def api_split_trajectory_subtasks(payload: Optional[dict] = None):
+        """One-click model split on an in-memory trajectory payload."""
+        from .subtask_splitter import SubtaskSplitError, SubtaskSplitter
+
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="trajectory JSON object required")
+        splitter = SubtaskSplitter()
+        if not splitter.configured:
+            raise HTTPException(
+                status_code=503,
+                detail="未配置划分模型（请设置 DUCKTRACK_QWEN_URL 或 DUCKTRACK_SUBTASK_URL）",
+            )
+        try:
+            # Work on a shallow-copied top-level dict so we don't surprise callers
+            import copy
+
+            data = copy.deepcopy(payload)
+            updated = splitter.split_trajectory_payload(data)
+        except SubtaskSplitError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+        return updated
+
     @app.post("/api/recordings/{name}/split_subtasks")
     def api_split_subtasks(name: str):
-        # Feature-2 placeholder
-        raise HTTPException(status_code=501, detail="subtask model split not implemented yet")
+        from .subtask_splitter import SubtaskSplitError, SubtaskSplitter
+
+        recording = Path(get_recordings_dir()) / name
+        if not recording.is_dir():
+            raise HTTPException(status_code=404, detail="recording not found")
+        splitter = SubtaskSplitter()
+        if not splitter.configured:
+            raise HTTPException(
+                status_code=503,
+                detail="未配置划分模型（请设置 DUCKTRACK_QWEN_URL 或 DUCKTRACK_SUBTASK_URL）",
+            )
+        try:
+            updated = splitter.split_recording(recording)
+        except SubtaskSplitError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}")
+        return updated
 
     @app.get("/api/uploads")
     def api_uploads():

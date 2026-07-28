@@ -57,6 +57,7 @@ def make_sub_task_metadata(
     split_at_unix: float | None = None,
     prompt_version: str | None = None,
     previous_sub_tasks: list | None = None,
+    previous_snapshot: dict | None = None,
 ) -> dict[str, Any]:
     if status not in VALID_STATUS:
         status = "none"
@@ -67,6 +68,7 @@ def make_sub_task_metadata(
         "split_at_unix": split_at_unix,
         "prompt_version": prompt_version,
         "previous_sub_tasks": previous_sub_tasks,
+        "previous_snapshot": previous_snapshot,
     }
 
 
@@ -267,6 +269,7 @@ def normalize_trajectory_subtasks(payload: dict) -> dict:
             split_at_unix=meta_raw.get("split_at_unix", meta.get("split_at_unix")),
             prompt_version=meta_raw.get("prompt_version"),
             previous_sub_tasks=meta_raw.get("previous_sub_tasks"),
+            previous_snapshot=meta_raw.get("previous_snapshot"),
         )
         return payload
 
@@ -278,6 +281,86 @@ def normalize_trajectory_subtasks(payload: dict) -> dict:
         split_at_unix=meta_raw.get("split_at_unix"),
         prompt_version=meta_raw.get("prompt_version"),
         previous_sub_tasks=meta_raw.get("previous_sub_tasks"),
+        previous_snapshot=meta_raw.get("previous_snapshot"),
+    )
+    return payload
+
+
+def snapshot_subtask_state(payload: dict) -> dict:
+    """Capture sub_tasks + metadata without nested previous_* fields."""
+    meta = payload.get("sub_task_metadata") if isinstance(payload.get("sub_task_metadata"), dict) else {}
+    clean_meta = {
+        "status": meta.get("status", "none"),
+        "splitter": meta.get("splitter", "none"),
+        "manual_boundary_count": int(meta.get("manual_boundary_count") or 0),
+        "split_at_unix": meta.get("split_at_unix"),
+        "prompt_version": meta.get("prompt_version"),
+        "previous_sub_tasks": None,
+        "previous_snapshot": None,
+    }
+    tasks = payload.get("sub_tasks") if isinstance(payload.get("sub_tasks"), list) else []
+    return {
+        "sub_tasks": json_clone(tasks),
+        "sub_task_metadata": clean_meta,
+    }
+
+
+def json_clone(value):
+    import copy
+
+    return copy.deepcopy(value)
+
+
+def apply_model_sub_tasks(payload: dict, new_sub_tasks: list, *, splitter: str, prompt_version: str) -> dict:
+    """Replace sub_tasks with model result; keep one-level undo snapshot."""
+    snapshot = snapshot_subtask_state(payload)
+    payload["sub_tasks"] = new_sub_tasks
+    payload["sub_task_metadata"] = make_sub_task_metadata(
+        status="completed",
+        splitter=splitter,
+        manual_boundary_count=0,
+        split_at_unix=time.time(),
+        prompt_version=prompt_version,
+        previous_sub_tasks=snapshot["sub_tasks"],
+        previous_snapshot=snapshot,
+    )
+    return payload
+
+
+def undo_model_sub_tasks(payload: dict) -> dict:
+    """Restore previous_snapshot; clear undo buffer."""
+    meta = payload.get("sub_task_metadata") if isinstance(payload.get("sub_task_metadata"), dict) else {}
+    snapshot = meta.get("previous_snapshot")
+    if not isinstance(snapshot, dict):
+        # Fallback to previous_sub_tasks only
+        prev_tasks = meta.get("previous_sub_tasks")
+        if not isinstance(prev_tasks, list):
+            raise ValueError("没有可撤销的模型划分备份")
+        payload["sub_tasks"] = json_clone(prev_tasks)
+        payload["sub_task_metadata"] = make_sub_task_metadata(
+            status=meta.get("status") or "none",
+            splitter="manual" if len(prev_tasks) > 1 else "none",
+            manual_boundary_count=max(0, len(prev_tasks) - 1) if len(prev_tasks) > 1 else 0,
+            split_at_unix=None,
+            prompt_version=None,
+            previous_sub_tasks=None,
+            previous_snapshot=None,
+        )
+        return payload
+
+    tasks = snapshot.get("sub_tasks")
+    old_meta = snapshot.get("sub_task_metadata") if isinstance(snapshot.get("sub_task_metadata"), dict) else {}
+    if not isinstance(tasks, list):
+        raise ValueError("撤销备份损坏：缺少 sub_tasks")
+    payload["sub_tasks"] = json_clone(tasks)
+    payload["sub_task_metadata"] = make_sub_task_metadata(
+        status=old_meta.get("status") or "none",
+        splitter=old_meta.get("splitter") or "none",
+        manual_boundary_count=int(old_meta.get("manual_boundary_count") or 0),
+        split_at_unix=old_meta.get("split_at_unix"),
+        prompt_version=old_meta.get("prompt_version"),
+        previous_sub_tasks=None,
+        previous_snapshot=None,
     )
     return payload
 

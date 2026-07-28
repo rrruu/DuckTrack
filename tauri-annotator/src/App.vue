@@ -18,12 +18,22 @@
         <div class="sidebar-section-label">子任务 / 步骤</div>
         <div class="subtask-toolbar">
           <button
+            class="btn primary"
+            type="button"
+            :disabled="subtaskSplitBusy || !trajectoryData"
+            title="用模型整轨划分子任务（覆盖当前分段，可撤销）"
+            @click="runModelSplitSubtasks"
+          >
+            {{ subtaskSplitBusy ? "划分中…" : "模型划分子任务" }}
+          </button>
+          <button
             class="btn"
             type="button"
-            disabled
-            title="后续版本：上传云端后由模型自动划分"
+            :disabled="subtaskSplitBusy || !canUndoModelSplit"
+            title="恢复一键划分前的子任务分段"
+            @click="undoModelSplitSubtasks"
           >
-            模型划分子任务
+            撤销模型划分
           </button>
         </div>
         <div class="step-list">
@@ -477,10 +487,17 @@ const recordingName = computed(() => {
 
 const trajectoryData = ref<any>(null);
 const screenshotFrameMode = ref<"before" | "after" | "settled">("before");
+const subtaskSplitBusy = ref(false);
 const steps = computed<Step[]>(() => trajectoryData.value?.trajectory || []);
 const subTasks = computed<any[]>(() =>
   Array.isArray(trajectoryData.value?.sub_tasks) ? trajectoryData.value.sub_tasks : []
 );
+const canUndoModelSplit = computed(() => {
+  const meta = trajectoryData.value?.sub_task_metadata;
+  if (!meta || typeof meta !== "object") return false;
+  if (meta.previous_snapshot && typeof meta.previous_snapshot === "object") return true;
+  return Array.isArray(meta.previous_sub_tasks);
+});
 
 const filteredIndices = computed(() => {
   const list = steps.value || [];
@@ -629,6 +646,7 @@ function ensureSubTaskDefaults() {
       split_at_unix: null,
       prompt_version: null,
       previous_sub_tasks: null,
+      previous_snapshot: null,
     };
   }
 }
@@ -724,6 +742,77 @@ function rebuildSubTasksAfterDelete(deletedIndex: number) {
   }
   next.forEach((t, i) => (t.index = i));
   trajectoryData.value.sub_tasks = next;
+}
+
+async function runModelSplitSubtasks() {
+  if (!trajectoryData.value || subtaskSplitBusy.value) return;
+  subtaskSplitBusy.value = true;
+  status.value = "正在调用模型划分子任务（整轨覆盖）…";
+  try {
+    await warmupBackend(true).catch(() => {});
+    let updated: any = null;
+    if (activeCloudSession.value) {
+      updated = await invoke("cloud_split_subtasks", {
+        sessionId: activeCloudSession.value,
+        trajectory: trajectoryData.value,
+      });
+    } else {
+      updated = await invoke("backend_split_subtasks", {
+        trajectory: trajectoryData.value,
+      });
+    }
+    if (!updated || typeof updated !== "object" || !Array.isArray(updated.trajectory)) {
+      throw new Error("模型返回的轨迹无效");
+    }
+    trajectoryData.value = updated;
+    ensureSubTaskDefaults();
+    dirty.value = true;
+    selectedViewIndex.value = 0;
+    status.value = `模型划分完成：${(updated.sub_tasks || []).length} 个子任务（可撤销）`;
+  } catch (e: any) {
+    status.value = `模型划分失败：${e?.message || String(e)}`;
+  } finally {
+    subtaskSplitBusy.value = false;
+  }
+}
+
+function undoModelSplitSubtasks() {
+  if (!trajectoryData.value || !canUndoModelSplit.value) return;
+  const meta = trajectoryData.value.sub_task_metadata || {};
+  const snapshot = meta.previous_snapshot;
+  if (snapshot && typeof snapshot === "object" && Array.isArray(snapshot.sub_tasks)) {
+    const oldMeta = snapshot.sub_task_metadata && typeof snapshot.sub_task_metadata === "object"
+      ? snapshot.sub_task_metadata
+      : {};
+    trajectoryData.value.sub_tasks = JSON.parse(JSON.stringify(snapshot.sub_tasks));
+    trajectoryData.value.sub_task_metadata = {
+      status: oldMeta.status || "none",
+      splitter: oldMeta.splitter || "none",
+      manual_boundary_count: Number(oldMeta.manual_boundary_count || 0),
+      split_at_unix: oldMeta.split_at_unix ?? null,
+      prompt_version: oldMeta.prompt_version ?? null,
+      previous_sub_tasks: null,
+      previous_snapshot: null,
+    };
+  } else if (Array.isArray(meta.previous_sub_tasks)) {
+    const prev = JSON.parse(JSON.stringify(meta.previous_sub_tasks));
+    trajectoryData.value.sub_tasks = prev;
+    trajectoryData.value.sub_task_metadata = {
+      status: prev.length > 1 ? "manual_complete" : "none",
+      splitter: prev.length > 1 ? "manual" : "none",
+      manual_boundary_count: prev.length > 1 ? prev.length - 1 : 0,
+      split_at_unix: null,
+      prompt_version: null,
+      previous_sub_tasks: null,
+      previous_snapshot: null,
+    };
+  } else {
+    status.value = "没有可撤销的模型划分备份";
+    return;
+  }
+  dirty.value = true;
+  selectedViewIndex.value = 0;
+  status.value = "已撤销模型划分，已恢复上一版子任务";
 }
 const previewPath = computed(() => {
   if (!recordingPath.value || !selectedStep.value) return "";
@@ -1774,6 +1863,9 @@ onBeforeUnmount(() => {
 
 .subtask-toolbar {
   padding: 0 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .subtask-toolbar .btn:disabled {

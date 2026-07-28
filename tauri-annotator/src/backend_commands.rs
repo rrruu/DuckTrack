@@ -109,6 +109,11 @@ fn stop_api_client() -> Result<Client, String> {
   backend_client(Duration::from_secs(180), Duration::from_millis(1200))
 }
 
+fn long_api_client() -> Result<Client, String> {
+  // Model sub-task split / annotation-style calls may take several minutes.
+  backend_client(Duration::from_secs(1800), Duration::from_secs(5))
+}
+
 fn is_backend_alive() -> bool {
   let url = format!("{}/api/recordings", backend_base_url());
   if let Ok(client) = health_client() {
@@ -1133,6 +1138,48 @@ pub async fn cloud_trigger_annotation(session_id: String) -> Result<(), String> 
       return Err(format!("cloud error {}: {}", response.status(), response.text().unwrap_or_default()));
     }
     Ok(())
+  })
+  .await
+  .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn backend_split_subtasks(trajectory: Value) -> Result<Value, String> {
+  tauri::async_runtime::spawn_blocking(move || {
+    let client = long_api_client()?;
+    let url = format!("{}/api/trajectory/split_subtasks", backend_base_url());
+    let response = client
+      .post(url)
+      .json(&trajectory)
+      .send()
+      .map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+      return Err(format!("backend error {}: {}", status, text));
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+  })
+  .await
+  .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn cloud_split_subtasks(session_id: String, trajectory: Option<Value>) -> Result<Value, String> {
+  tauri::async_runtime::spawn_blocking(move || {
+    let client = long_api_client()?;
+    let path = format!("/api/v1/sessions/{}/split_subtasks", session_id);
+    let mut request = cloud_request(&client, reqwest::Method::POST, &path);
+    if let Some(payload) = trajectory {
+      request = request.json(&payload);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+      return Err(format!("cloud error {}: {}", status, text));
+    }
+    serde_json::from_str(&text).map_err(|e| e.to_string())
   })
   .await
   .map_err(|e| e.to_string())?

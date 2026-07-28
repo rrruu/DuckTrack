@@ -144,6 +144,8 @@ fn main() {
       backend_commands::cloud_download_session,
       backend_commands::cloud_save_reviewed,
       backend_commands::cloud_trigger_annotation,
+      backend_commands::backend_split_subtasks,
+      backend_commands::cloud_split_subtasks,
       backend_commands::read_text_file,
       backend_commands::file_size_bytes,
       backend_commands::write_text_file,
