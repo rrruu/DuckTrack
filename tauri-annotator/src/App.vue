@@ -2203,22 +2203,28 @@ onBeforeUnmount(() => {
 
 .right-panel {
   flex: 1;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 12px 16px 16px;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .video-wrap {
-  flex: 1;
-  min-height: 0;
+  flex: 1 1 auto;
+  /* 下方标注表单变高时，禁止把截图区挤成 0 高度 */
+  min-height: min(42vh, 420px);
+  height: min(48vh, 520px);
+  max-height: 560px;
   background: #0d0d0d;
   border-radius: 12px;
   overflow: hidden;
   position: relative;
   border: 1px solid var(--border-subtle);
+  flex-shrink: 0;
 }
 
 .video-empty-tip {
@@ -2451,6 +2457,7 @@ onBeforeUnmount(() => {
   align-items: center;
   margin-bottom: 10px;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .zoom-btn {
