@@ -120,7 +120,9 @@ class CloudSessionStore:
             payload = copy.deepcopy(trajectory)
             try:
                 updated = self.subtask_splitter.split_trajectory_payload(
-                    payload, response_dir=recording / "model_responses"
+                    payload,
+                    response_dir=recording / "model_responses",
+                    recording=recording,
                 )
             except SubtaskSplitError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))

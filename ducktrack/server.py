@@ -171,9 +171,29 @@ def create_app():
     def api_sub_task_state():
         return manager.sub_task_state()
 
+    @app.get("/api/subtask_splitter/status")
+    def api_subtask_splitter_status():
+        """Used by the Tauri launcher to detect a stale backend without model env."""
+        from .subtask_splitter import SubtaskSplitter
+
+        splitter = SubtaskSplitter()
+        return {
+            "configured": splitter.configured,
+            "vision_enabled": bool(getattr(splitter, "vision_enabled", False)),
+            "max_images": int(getattr(splitter, "max_images", 0) or 0),
+            "model": splitter.model if splitter.configured else None,
+            "url_configured": bool(splitter.url),
+        }
+
     @app.post("/api/trajectory/split_subtasks")
-    def api_split_trajectory_subtasks(payload: Optional[dict] = None):
-        """One-click model split on an in-memory trajectory payload."""
+    def api_split_trajectory_subtasks(
+        payload: Optional[dict] = None,
+        recording_dir: Optional[str] = None,
+    ):
+        """One-click model split on an in-memory trajectory payload.
+
+        Optional query `recording_dir` enables v2 keyframe vision (read frames from that folder).
+        """
         from .subtask_splitter import SubtaskSplitError, SubtaskSplitter
 
         if not isinstance(payload, dict):
@@ -184,12 +204,22 @@ def create_app():
                 status_code=503,
                 detail="未配置划分模型（请设置 DUCKTRACK_QWEN_URL 或 DUCKTRACK_SUBTASK_URL）",
             )
+        recording_path = None
+        if isinstance(recording_dir, str) and recording_dir.strip():
+            candidate = Path(recording_dir.strip())
+            if candidate.is_dir():
+                recording_path = candidate
+            else:
+                raise HTTPException(status_code=400, detail=f"recording_dir 不是有效目录: {recording_dir}")
         try:
-            # Work on a shallow-copied top-level dict so we don't surprise callers
             import copy
 
             data = copy.deepcopy(payload)
-            updated = splitter.split_trajectory_payload(data)
+            updated = splitter.split_trajectory_payload(
+                data,
+                recording=recording_path,
+                response_dir=(recording_path / "model_responses") if recording_path else None,
+            )
         except SubtaskSplitError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:

@@ -759,6 +759,7 @@ async function runModelSplitSubtasks() {
     } else {
       updated = await invoke("backend_split_subtasks", {
         trajectory: trajectoryData.value,
+        recordingPath: recordingPath.value || null,
       });
     }
     if (!updated || typeof updated !== "object" || !Array.isArray(updated.trajectory)) {
@@ -768,7 +769,14 @@ async function runModelSplitSubtasks() {
     ensureSubTaskDefaults();
     dirty.value = true;
     selectedViewIndex.value = 0;
-    status.value = `模型划分完成：${(updated.sub_tasks || []).length} 个子任务（可撤销）`;
+    const visionMeta = updated?.sub_task_metadata || {};
+    const modeHint =
+      visionMeta.prompt_version === "subtask-split-v2"
+        ? "（看图划分 v2）"
+        : visionMeta.prompt_version === "subtask-split-v1"
+          ? "（文本划分 v1）"
+          : "";
+    status.value = `模型划分完成：${(updated.sub_tasks || []).length} 个子任务${modeHint}（可撤销）`;
   } catch (e: any) {
     status.value = `模型划分失败：${e?.message || String(e)}`;
   } finally {

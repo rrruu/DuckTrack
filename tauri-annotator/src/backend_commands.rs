@@ -553,11 +553,102 @@ fn start_native_backend_process() -> Result<String, String> {
   ))
 }
 
+fn parent_has_model_url() -> bool {
+  for key in ["DUCKTRACK_QWEN_URL", "DUCKTRACK_SUBTASK_URL"] {
+    if let Ok(value) = std::env::var(key) {
+      if !value.trim().is_empty() {
+        return true;
+      }
+    }
+  }
+  false
+}
+
+fn backend_splitter_configured() -> bool {
+  let Ok(client) = health_client() else {
+    return false;
+  };
+  let url = format!("{}/api/subtask_splitter/status", backend_base_url());
+  let Ok(response) = client.get(url).send() else {
+    return false;
+  };
+  if !response.status().is_success() {
+    return false;
+  }
+  response
+    .json::<Value>()
+    .ok()
+    .and_then(|body| body.get("configured").and_then(|v| v.as_bool()))
+    .unwrap_or(false)
+}
+
+fn stop_tracked_backend_child() {
+  if let Ok(mut guard) = BACKEND_CHILD.lock() {
+    if let Some(mut proc) = guard.take() {
+      let _ = proc.kill();
+      let _ = proc.wait();
+    }
+  }
+}
+
+#[cfg(windows)]
+fn kill_backend_port_listeners() {
+  use std::os::windows::process::CommandExt;
+  const CREATE_NO_WINDOW: u32 = 0x08000000;
+  let Ok(output) = Command::new("cmd")
+    .args(["/C", "netstat -ano | findstr :18765 | findstr LISTENING"])
+    .creation_flags(CREATE_NO_WINDOW)
+    .output()
+  else {
+    return;
+  };
+  let text = String::from_utf8_lossy(&output.stdout);
+  let mut pids = std::collections::BTreeSet::new();
+  for line in text.lines() {
+    if let Some(pid) = line.split_whitespace().last() {
+      if pid.chars().all(|c| c.is_ascii_digit()) {
+        pids.insert(pid.to_string());
+      }
+    }
+  }
+  for pid in pids {
+    let _ = Command::new("taskkill")
+      .args(["/F", "/PID", &pid])
+      .creation_flags(CREATE_NO_WINDOW)
+      .output();
+  }
+}
+
+#[cfg(not(windows))]
+fn kill_backend_port_listeners() {}
+
+fn restart_stale_unconfigured_backend() -> bool {
+  if !is_backend_alive() {
+    return false;
+  }
+  if !parent_has_model_url() {
+    return false;
+  }
+  if backend_splitter_configured() {
+    return false;
+  }
+  stop_tracked_backend_child();
+  kill_backend_port_listeners();
+  // Give the port a moment to release
+  thread::sleep(Duration::from_millis(300));
+  true
+}
+
 fn start_backend_process() -> Result<String, String> {
   let _start_guard = BACKEND_START_LOCK.lock().map_err(|e| e.to_string())?;
 
+  let restarted = restart_stale_unconfigured_backend();
   if is_backend_alive() {
-    return Ok("backend already running".to_string());
+    return Ok(if restarted {
+      "backend already running after restart check".to_string()
+    } else {
+      "backend already running".to_string()
+    });
   }
 
   if env_flag("DUCKTRACK_PREFER_NATIVE_BACKEND", false) {
@@ -1144,12 +1235,20 @@ pub async fn cloud_trigger_annotation(session_id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
-pub async fn backend_split_subtasks(trajectory: Value) -> Result<Value, String> {
+pub async fn backend_split_subtasks(
+  trajectory: Value,
+  recording_path: Option<String>,
+) -> Result<Value, String> {
   tauri::async_runtime::spawn_blocking(move || {
     let client = long_api_client()?;
     let url = format!("{}/api/trajectory/split_subtasks", backend_base_url());
-    let response = client
-      .post(url)
+    let mut request = client.post(url);
+    if let Some(ref path) = recording_path {
+      if !path.trim().is_empty() {
+        request = request.query(&[("recording_dir", path)]);
+      }
+    }
+    let response = request
       .json(&trajectory)
       .send()
       .map_err(|e| e.to_string())?;
