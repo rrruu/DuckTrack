@@ -65,20 +65,111 @@
 
     <div class="main-column">
       <header class="topbar">
-        <div class="dir-input-wrap">
+        <div
+          class="dir-input-wrap hover-tip-host"
+          @mouseenter="openHoverTip('path')"
+          @mouseleave="scheduleCloseHoverTip('path')"
+        >
           <input
             class="dir-input"
             v-model="directoryInput"
             placeholder="录制目录路径…"
           />
+          <div
+            v-if="hoverTip === 'path' && directoryInput.trim()"
+            class="hover-tip-card"
+            @mouseenter="openHoverTip('path')"
+            @mouseleave="scheduleCloseHoverTip('path')"
+            @mousedown.stop
+          >
+            <div class="hover-tip-header">
+              <div class="hover-tip-label">录制目录完整路径</div>
+              <button
+                class="hover-tip-copy"
+                type="button"
+                :title="hoverTipCopied === 'path' ? '已复制' : '复制'"
+                @click.stop="copyHoverTipText('path', directoryInput)"
+              >
+                <span v-if="hoverTipCopied === 'path'" class="hover-tip-copy-done">✓</span>
+                <svg v-else class="hover-tip-copy-icon" viewBox="0 0 16 16" aria-hidden="true">
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  <rect x="2.5" y="2.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                </svg>
+              </button>
+            </div>
+            <div class="hover-tip-text">{{ directoryInput }}</div>
+          </div>
         </div>
-        <button class="btn" @click="browseRecordingDir">浏览</button>
-        <button class="btn" @click="browseVideoFile">视频</button>
-        <button class="btn" @click="pickRecordingDir">加载</button>
-        <button class="btn primary" :disabled="!dirty" @click="saveAnnotations">保存</button>
-        <span class="status-pill" v-if="status">{{ status }}</span>
-        <span class="spacer"></span>
-        <span class="recording-tag" v-if="recordingName">{{ recordingName }}</span>
+        <div class="topbar-actions">
+          <button class="btn" type="button" @click="browseRecordingDir">浏览</button>
+          <button class="btn" type="button" @click="browseVideoFile">视频</button>
+          <button class="btn" type="button" @click="pickRecordingDir">加载</button>
+          <button class="btn primary" type="button" :disabled="!dirty" @click="saveAnnotations">保存</button>
+        </div>
+        <div
+          v-if="status"
+          class="status-pill-wrap hover-tip-host"
+          @mouseenter="openHoverTip('status')"
+          @mouseleave="scheduleCloseHoverTip('status')"
+        >
+          <span class="status-pill">{{ status }}</span>
+          <div
+            v-if="hoverTip === 'status'"
+            class="hover-tip-card hover-tip-card-status"
+            @mouseenter="openHoverTip('status')"
+            @mouseleave="scheduleCloseHoverTip('status')"
+            @mousedown.stop
+          >
+            <div class="hover-tip-header">
+              <div class="hover-tip-label">完整状态</div>
+              <button
+                class="hover-tip-copy"
+                type="button"
+                :title="hoverTipCopied === 'status' ? '已复制' : '复制'"
+                @click.stop="copyHoverTipText('status', status)"
+              >
+                <span v-if="hoverTipCopied === 'status'" class="hover-tip-copy-done">✓</span>
+                <svg v-else class="hover-tip-copy-icon" viewBox="0 0 16 16" aria-hidden="true">
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  <rect x="2.5" y="2.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                </svg>
+              </button>
+            </div>
+            <div class="hover-tip-text">{{ status }}</div>
+          </div>
+        </div>
+        <div
+          v-if="recordingName"
+          class="recording-tag-wrap hover-tip-host"
+          @mouseenter="openHoverTip('recording')"
+          @mouseleave="scheduleCloseHoverTip('recording')"
+        >
+          <span class="recording-tag">{{ recordingName }}</span>
+          <div
+            v-if="hoverTip === 'recording'"
+            class="hover-tip-card"
+            @mouseenter="openHoverTip('recording')"
+            @mouseleave="scheduleCloseHoverTip('recording')"
+            @mousedown.stop
+          >
+            <div class="hover-tip-header">
+              <div class="hover-tip-label">录制名称</div>
+              <button
+                class="hover-tip-copy"
+                type="button"
+                :title="hoverTipCopied === 'recording' ? '已复制' : '复制'"
+                @click.stop="copyHoverTipText('recording', recordingName)"
+              >
+                <span v-if="hoverTipCopied === 'recording'" class="hover-tip-copy-done">✓</span>
+                <svg v-else class="hover-tip-copy-icon" viewBox="0 0 16 16" aria-hidden="true">
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                  <rect x="2.5" y="2.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4" />
+                </svg>
+              </button>
+            </div>
+            <div class="hover-tip-text">{{ recordingName }}</div>
+          </div>
+        </div>
       </header>
 
       <main v-if="!enteredAnnotator" class="workflow-main">
@@ -376,8 +467,10 @@ const ACTION_CN: Record<string, string> = {
   doubleRightClick: "右键双击",
   dragTo: "拖拽",
   moveTo: "移动到",
+  hover: "鼠标悬停",
   scroll: "滚轮滚动",
   type: "文字输入",
+  hotkey: "快捷键",
   keyDown: "按键按下",
   keyUp: "按键释放",
   pause: "录制暂停",
@@ -465,6 +558,58 @@ function clearActionPreviewOverlay() {
 const recordingPath = ref<string | null>(null);
 const directoryInput = ref("");
 const enteredAnnotator = ref(false);
+
+/** Topbar hover tip: path / status / recording — delay hide so user can select & copy text */
+const hoverTip = ref<"path" | "status" | "recording" | null>(null);
+const hoverTipCopied = ref<"path" | "status" | "recording" | null>(null);
+let hoverTipCloseTimer: number | null = null;
+let hoverTipCopiedTimer: number | null = null;
+
+function openHoverTip(kind: "path" | "status" | "recording") {
+  if (hoverTipCloseTimer != null) {
+    window.clearTimeout(hoverTipCloseTimer);
+    hoverTipCloseTimer = null;
+  }
+  hoverTip.value = kind;
+}
+
+function scheduleCloseHoverTip(kind: "path" | "status" | "recording") {
+  if (hoverTipCloseTimer != null) {
+    window.clearTimeout(hoverTipCloseTimer);
+  }
+  hoverTipCloseTimer = window.setTimeout(() => {
+    if (hoverTip.value === kind) hoverTip.value = null;
+    hoverTipCloseTimer = null;
+  }, 220);
+}
+
+async function copyHoverTipText(kind: "path" | "status" | "recording", text: string) {
+  const value = (text || "").trim();
+  if (!value) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    hoverTipCopied.value = kind;
+    if (hoverTipCopiedTimer != null) window.clearTimeout(hoverTipCopiedTimer);
+    hoverTipCopiedTimer = window.setTimeout(() => {
+      if (hoverTipCopied.value === kind) hoverTipCopied.value = null;
+      hoverTipCopiedTimer = null;
+    }, 1200);
+  } catch (_e) {
+    // Keep tip open; user can still select text manually.
+  }
+}
 const trajectoryPath = computed(() => {
   if (!recordingPath.value) return null;
   return `${recordingPath.value}\\trajectory.json`;
@@ -947,7 +1092,9 @@ function formatStepLabel(step: Step): string {
   }
   if (typeof p.text === "string") parts.push(`"${p.text}"`);
   if (typeof p.key === "string") parts.push(`键=${p.key}`);
+  if (Array.isArray(p.keys) && p.keys.length) parts.push(p.keys.join("+"));
   if (a.name === "scroll" && typeof p.clicks === "number") parts.push(`clicks=${p.clicks}`);
+  if (a.name === "hover" && typeof p.duration === "number") parts.push(`${p.duration.toFixed(1)}s`);
   return parts.join("  ");
 }
 
@@ -1773,6 +1920,14 @@ async function triggerCloudAnnotation() {
 
 onBeforeUnmount(() => {
   if (previewTimer) window.clearTimeout(previewTimer);
+  if (hoverTipCloseTimer != null) {
+    window.clearTimeout(hoverTipCloseTimer);
+    hoverTipCloseTimer = null;
+  }
+  if (hoverTipCopiedTimer != null) {
+    window.clearTimeout(hoverTipCopiedTimer);
+    hoverTipCopiedTimer = null;
+  }
   void invoke("hide_floating_controls").catch(() => {});
 });
 </script>
@@ -1959,18 +2114,29 @@ onBeforeUnmount(() => {
   gap: 8px;
   padding: 10px 16px;
   min-height: 52px;
+  height: 52px;
   box-sizing: border-box;
   border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
+  flex-wrap: nowrap;
+  overflow: visible;
+  min-width: 0;
 }
 
 .dir-input-wrap {
-  flex: 1;
+  /* Path: medium width — slightly longer than recording name, shorter than status */
+  flex: 0 0 clamp(200px, 22vw, 280px);
+  width: clamp(200px, 22vw, 280px);
   min-width: 200px;
+  max-width: 280px;
+  position: relative;
+  overflow: visible;
 }
 
 .dir-input {
+  display: block;
   width: 100%;
+  box-sizing: border-box;
   padding: 10px 14px;
   border: none;
   border-radius: 12px;
@@ -1979,6 +2145,9 @@ onBeforeUnmount(() => {
   color: var(--text);
   outline: none;
   box-shadow: 0 0 0 1px var(--border-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .dir-input::placeholder {
@@ -1987,6 +2156,158 @@ onBeforeUnmount(() => {
 
 .dir-input:focus {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.2);
+  text-overflow: clip;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  flex-shrink: 0;
+}
+
+.topbar .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.status-pill-wrap {
+  /* Status: longest of the three text regions */
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 220px;
+  max-width: none;
+  overflow: visible;
+}
+
+.status-pill {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.recording-tag-wrap {
+  /* Recording name: shortest; keep on the right */
+  position: relative;
+  flex: 0 0 clamp(140px, 16vw, 220px);
+  width: clamp(140px, 16vw, 220px);
+  min-width: 140px;
+  max-width: 220px;
+  margin-left: 0;
+}
+
+.recording-tag {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.hover-tip-host {
+  z-index: 1;
+}
+
+.hover-tip-card {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  min-width: 220px;
+  max-width: min(520px, 70vw);
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: #1a1a1a;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+
+.hover-tip-card-status {
+  left: 0;
+  right: auto;
+  max-width: min(560px, 75vw);
+}
+
+/* Keep right-edge tip inside the window */
+.recording-tag-wrap .hover-tip-card {
+  left: auto;
+  right: 0;
+  max-width: min(420px, 60vw);
+}
+
+.hover-tip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.hover-tip-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  user-select: none;
+  min-width: 0;
+}
+
+.hover-tip-copy {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.hover-tip-copy:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--border-subtle);
+}
+
+.hover-tip-copy-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.hover-tip-copy-done {
+  font-size: 12px;
+  color: var(--accent);
+  line-height: 1;
+}
+
+.hover-tip-text {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  user-select: text;
+  cursor: text;
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 .btn {
@@ -2025,31 +2346,6 @@ onBeforeUnmount(() => {
 .btn.full {
   width: 100%;
   justify-content: center;
-}
-
-.status-pill {
-  font-size: 12px;
-  color: var(--text-dim);
-  max-width: min(52vw, 860px);
-  overflow-wrap: anywhere;
-  white-space: normal;
-  line-height: 1.35;
-}
-
-.recording-tag {
-  font-size: 12px;
-  color: var(--text-muted);
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: var(--bg-input);
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.spacer {
-  flex: 1;
 }
 
 .workflow-main {

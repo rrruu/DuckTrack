@@ -19,6 +19,88 @@ from .screen_video import ScreenVideoRecorder
 from .subtask_schema import build_covering_sub_tasks, last_actionable_step_index, new_sub_task_id
 from .util import fix_windows_dpi_scaling, get_recordings_dir
 
+# Canonical modifier names used in exported hotkey steps.
+_MODIFIER_CANON = {
+    "ctrl": "ctrl",
+    "ctrl_l": "ctrl",
+    "ctrl_r": "ctrl",
+    "control": "ctrl",
+    "control_l": "ctrl",
+    "control_r": "ctrl",
+    "alt": "alt",
+    "alt_l": "alt",
+    "alt_r": "alt",
+    "alt_gr": "alt",
+    "shift": "shift",
+    "shift_l": "shift",
+    "shift_r": "shift",
+    "cmd": "win",
+    "cmd_l": "win",
+    "cmd_r": "win",
+    "meta": "win",
+    "meta_l": "win",
+    "meta_r": "win",
+    "win": "win",
+    "windows": "win",
+    "super": "win",
+}
+# Shift alone does not make a chord; need ctrl/alt/win (etc.).
+_CHORD_MODIFIERS = frozenset({"ctrl", "alt", "win"})
+_HOTKEY_MODIFIER_ORDER = ("ctrl", "alt", "shift", "win")
+
+
+def _canonical_key_name(name) -> str | None:
+    if name is None:
+        return None
+    raw = str(name).strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("key."):
+        lowered = lowered[4:]
+    if lowered in _MODIFIER_CANON:
+        return _MODIFIER_CANON[lowered]
+    if len(raw) == 1:
+        return raw.lower() if raw.isalpha() else raw
+    return lowered
+
+
+def _is_modifier_key(name) -> bool:
+    canon = _canonical_key_name(name)
+    return canon in _MODIFIER_CANON.values()
+
+
+def _chord_qualifies(held_modifiers: set[str]) -> bool:
+    return bool(held_modifiers & _CHORD_MODIFIERS)
+
+
+def _main_key_from_input_text(text) -> str | None:
+    """Map key_input text to a hotkey main key (e.g. Ctrl+V -> '\\x16' -> 'v')."""
+    if text is None:
+        return None
+    s = str(text)
+    if not s:
+        return None
+    if len(s) == 1:
+        code = ord(s)
+        if 1 <= code <= 26:
+            return chr(ord("a") + code - 1)
+        if s.isalpha():
+            return s.lower()
+        if s.isprintable():
+            return s
+    return s
+
+
+def _ordered_hotkey_keys(held_modifiers: set[str], main_key: str) -> list[str]:
+    keys = [m for m in _HOTKEY_MODIFIER_ORDER if m in held_modifiers]
+    for m in sorted(held_modifiers):
+        if m not in keys:
+            keys.append(m)
+    if main_key and main_key not in keys:
+        keys.append(main_key)
+    return keys
+
 
 class Recorder(threading.Thread):
     """
@@ -98,6 +180,29 @@ class Recorder(threading.Thread):
             "right": {"time_stamp": 0.0, "position": None}
         }
 
+        # Long-dwell hover: only emit after cursor stays still for N seconds.
+        self._hover_enabled = os.environ.get("DUCKTRACK_HOVER", "1").lower() in {
+            "1", "true", "yes", "on"
+        }
+        try:
+            self._hover_dwell_s = float(os.environ.get("DUCKTRACK_HOVER_DWELL_S", "5") or 5)
+        except Exception:
+            self._hover_dwell_s = 5.0
+        if self._hover_dwell_s < 0.5:
+            self._hover_dwell_s = 0.5
+        try:
+            self._hover_jitter_px = float(os.environ.get("DUCKTRACK_HOVER_JITTER_PX", "8") or 8)
+        except Exception:
+            self._hover_jitter_px = 8.0
+        self._hover_anchor = None  # (x, y)
+        self._hover_since = None
+        self._hover_emitted = False
+        self._hover_qualified = False
+        self._hover_snapshot_rel = None
+        self._hover_snapshot_frames = None
+        self._hover_frame_seq = 0
+        self._hover_lock = threading.Lock()
+
         # Sub-task segmentation (Feature-1): first segment starts at index 0.
         self._current_sub_task_id = new_sub_task_id()
         self._sub_task_index = 0
@@ -129,12 +234,131 @@ class Recorder(threading.Thread):
 
         self._dropped_events += 1
 
+    def _clear_hover_state(self):
+        self._hover_anchor = None
+        self._hover_since = None
+        self._hover_emitted = False
+        self._hover_qualified = False
+        self._hover_snapshot_rel = None
+        self._hover_snapshot_frames = None
+
+    def _reset_hover_tracking(self, end_time: float | None = None):
+        """Finalize a long dwell (if any), then clear tracking state."""
+        with self._hover_lock:
+            self._finalize_hover_unlocked(end_time)
+            self._clear_hover_state()
+
+    def _capture_hover_snapshot(self):
+        """Grab a mid-hover screenshot while the cursor is still dwelling."""
+        if not self.save_screenshots or self.obj_dir is None:
+            return
+        if self._hover_snapshot_rel is not None:
+            return
+        try:
+            self._hover_frame_seq += 1
+            # High id range avoids clashing with normal event frame names.
+            frame_id = 8_000_000 + self._hover_frame_seq
+            frames = self.adaptive_capture.request_event_frames(frame_id)
+            self._hover_snapshot_rel = frames.get("before")
+            self._hover_snapshot_frames = frames
+            if self._hover_snapshot_rel:
+                self._last_screenshot_rel = self._hover_snapshot_rel
+                self._last_screenshot_ts = time.perf_counter()
+        except Exception:
+            pass
+
+    def _finalize_hover(self, end_time: float | None = None):
+        with self._hover_lock:
+            self._finalize_hover_unlocked(end_time)
+
+    def _finalize_hover_unlocked(self, end_time: float | None = None):
+        """
+        Emit one hover step when a dwell ends, using the *actual* stay duration.
+
+        The dwell threshold only decides whether the stay counts; duration is
+        measured from stillness start until leave / click / scroll / key / stop.
+        """
+        if not self._hover_enabled:
+            return
+        if self._hover_emitted:
+            return
+        if self._hover_anchor is None or self._hover_since is None:
+            return
+        now = float(end_time if end_time is not None else time.perf_counter())
+        dwell = now - float(self._hover_since)
+        if dwell < self._hover_dwell_s:
+            return
+        x, y = self._hover_anchor
+        self._hover_emitted = True
+        event = {
+            # Place the step at dwell start; duration covers the full stay.
+            "time_stamp": float(self._hover_since),
+            "action": "hover",
+            "x": x,
+            "y": y,
+            "duration": round(dwell, 3),
+        }
+        if self._hover_snapshot_rel:
+            event["observation"] = self._hover_snapshot_rel
+            event["objects"] = self._hover_snapshot_rel
+            if self._hover_snapshot_frames:
+                event["frames"] = self._hover_snapshot_frames
+        self._enqueue_event(event, important=True)
+
+    def _note_hover_motion(self, x, y):
+        """Track free-cursor stillness; emit only when a long dwell ends."""
+        if not self._hover_enabled or self._is_paused:
+            return
+        now = time.perf_counter()
+        with self._hover_lock:
+            if self._hover_anchor is None or self._hover_since is None:
+                self._hover_anchor = (float(x), float(y))
+                self._hover_since = now
+                self._hover_emitted = False
+                self._hover_qualified = False
+                self._hover_snapshot_rel = None
+                self._hover_snapshot_frames = None
+                return
+            ax, ay = self._hover_anchor
+            if math.hypot(float(x) - ax, float(y) - ay) > self._hover_jitter_px:
+                # Leaving the dwell: record full duration if it qualified.
+                self._finalize_hover_unlocked(now)
+                self._hover_anchor = (float(x), float(y))
+                self._hover_since = now
+                self._hover_emitted = False
+                self._hover_qualified = False
+                self._hover_snapshot_rel = None
+                self._hover_snapshot_frames = None
+
+    def _maybe_qualify_hover(self):
+        """Once stillness reaches the threshold, mark qualified and snapshot UI."""
+        if not self._hover_enabled or self._is_paused or not self._is_recording:
+            return
+        if self._pressed_button is not None:
+            return
+        with self._hover_lock:
+            if self._hover_anchor is None or self._hover_since is None or self._hover_emitted:
+                return
+            now = time.perf_counter()
+            dwell = now - float(self._hover_since)
+            if dwell < self._hover_dwell_s:
+                return
+            if not self._hover_qualified:
+                self._hover_qualified = True
+                self._capture_hover_snapshot()
+
     def on_move(self, x, y):
-        if self._is_paused or self._pressed_button is None or self._press_pos is None:
+        if self._is_paused:
+            return
+
+        # Free cursor: only track for long-dwell hover (no per-move flood).
+        if self._pressed_button is None or self._press_pos is None:
+            self._note_hover_motion(x, y)
             return
 
         distance = math.sqrt((x - self._press_pos[0]) ** 2 + (y - self._press_pos[1]) ** 2)
         if self._active_drag_button is None and distance >= self._drag_threshold:
+            self._reset_hover_tracking()
             now = time.perf_counter()
             self._active_drag_button = self._pressed_button
             self._last_drag_move_ts = now
@@ -196,6 +420,7 @@ class Recorder(threading.Thread):
         button_name = button.name
 
         if pressed:
+            self._reset_hover_tracking()
             self._pressed_button = button_name
             self._press_pos = (x, y)
             return
@@ -232,9 +457,12 @@ class Recorder(threading.Thread):
 
         self._pressed_button = None
         self._press_pos = None
+        # Resume free-cursor dwell tracking from the release point.
+        self._note_hover_motion(x, y)
 
     def on_scroll(self, x, y, dx, dy):
         if not self._is_paused:
+            self._reset_hover_tracking()
             self._enqueue_event({
                 "time_stamp": time.perf_counter(),
                 "action": "scroll",
@@ -243,9 +471,11 @@ class Recorder(threading.Thread):
                 "dx": dx,
                 "dy": dy
             }, important=True)
+            self._note_hover_motion(x, y)
 
     def on_press(self, key):
         if not self._is_paused:
+            self._reset_hover_tracking()
             event_time = time.perf_counter()
             if isinstance(key, KeyCode) and key.char is not None:
                 # Printable chars only emit key_input to avoid 3x event explosion.
@@ -289,9 +519,11 @@ class Recorder(threading.Thread):
                 try:
                     event = self.event_queue.get(timeout=0.2)
                 except Empty:
+                    self._maybe_qualify_hover()
                     continue
                 self._capture_step_artifacts(event)
                 self.events_file.write(json.dumps(event) + "\n")
+                self._maybe_qualify_hover()
             if self._dropped_events:
                 self.events_file.write(json.dumps({
                     "time_stamp": time.perf_counter(),
@@ -326,6 +558,7 @@ class Recorder(threading.Thread):
             "drag_start",
             "drag_end",
             "scroll",
+            "hover",
             "pause",
             "resume",
             "sub_task_boundary",
@@ -333,13 +566,17 @@ class Recorder(threading.Thread):
 
         if self.save_screenshots and self.obj_dir is not None:
             now = float(event.get("time_stamp") or time.perf_counter())
+            preset_obs = event.get("observation")
             should_capture = (
-                wants_fresh
-                or self._last_screenshot_rel is None
-                or (
-                    not is_key_action
-                    and not is_motion_sample
-                    and (now - self._last_screenshot_ts) >= self._screenshot_min_interval_s
+                preset_obs is None
+                and (
+                    wants_fresh
+                    or self._last_screenshot_rel is None
+                    or (
+                        not is_key_action
+                        and not is_motion_sample
+                        and (now - self._last_screenshot_ts) >= self._screenshot_min_interval_s
+                    )
                 )
             )
 
@@ -353,11 +590,16 @@ class Recorder(threading.Thread):
                     # Best-effort screenshot capture; never fail the whole recording.
                     pass
 
-            event["observation"] = self._last_screenshot_rel
-            event["objects"] = self._last_screenshot_rel
+            if preset_obs is not None:
+                event["observation"] = preset_obs
+                event["objects"] = event.get("objects") or preset_obs
+                self._last_screenshot_rel = preset_obs
+            else:
+                event["observation"] = self._last_screenshot_rel
+                event["objects"] = self._last_screenshot_rel
         else:
-            event["observation"] = None
-            event["objects"] = None
+            event["observation"] = event.get("observation")
+            event["objects"] = event.get("objects")
 
         # Optional debug artifact: skip noisy key events to reduce disk I/O.
         if self.save_step_files and step_path and not is_key_action:
@@ -368,6 +610,13 @@ class Recorder(threading.Thread):
         self._step_counter += 1
 
     def stop_recording(self):
+        # Flush any in-progress long hover with its true duration before stopping.
+        try:
+            self._finalize_hover()
+        except Exception:
+            pass
+        with self._hover_lock:
+            self._clear_hover_state()
         self._is_recording = False
         with self._finalize_lock:
             if self._finalize_started:
@@ -480,6 +729,10 @@ class Recorder(threading.Thread):
         typing_start_elapsed = None
         typing_observation = None
         typing_objects = None
+        # Deferred modifier state for hotkey merging.
+        # Shift alone never forms a hotkey; ctrl/alt/win (+ optional shift) does.
+        held_modifiers: dict[str, dict] = {}
+        skip_main_key_releases: set[str] = set()
 
         # Suppress accidental double-releases logged as two very close clicks at ~same spot.
         _last_click_export = None  # (elapsed, nx, ny, kind)
@@ -539,6 +792,39 @@ class Recorder(threading.Thread):
             typing_observation = None
             typing_objects = None
 
+        def held_canon_set() -> set[str]:
+            return set(held_modifiers.keys())
+
+        def ensure_modifier_downs_emitted(elapsed, observation=None, objects=None):
+            """Emit deferred keyDown for modifiers not consumed by hotkey/typing-assist."""
+            for canon, info in held_modifiers.items():
+                if info.get("consumed_hotkey") or info.get("typing_assist"):
+                    continue
+                if info.get("emitted_down"):
+                    continue
+                append_real_action(
+                    "keyDown",
+                    {"key": info.get("raw_name") or canon},
+                    elapsed,
+                    observation if observation is not None else info.get("observation"),
+                    objects if objects is not None else info.get("objects"),
+                )
+                info["emitted_down"] = True
+
+        def emit_hotkey(main_key: str, elapsed, observation=None, objects=None):
+            flush_typing_buffer()
+            keys = _ordered_hotkey_keys(held_canon_set(), main_key)
+            append_real_action(
+                "hotkey",
+                {"keys": keys},
+                elapsed,
+                observation,
+                objects,
+            )
+            for info in held_modifiers.values():
+                info["consumed_hotkey"] = True
+                info["typing_assist"] = False
+
         def should_skip_spurious_click(elapsed, nx, ny, kind: str) -> bool:
             nonlocal _last_click_export
             if _last_click_export is None:
@@ -576,6 +862,11 @@ class Recorder(threading.Thread):
 
             if action == "sub_task_boundary":
                 flush_typing_buffer()
+                ensure_modifier_downs_emitted(
+                    event["time_stamp"] - first_ts,
+                    event.get("observation"),
+                    event.get("objects"),
+                )
                 export_boundary_count += 1
                 subtask_ranges.append({
                     "id": event.get("sub_task_id") or new_sub_task_id(),
@@ -586,9 +877,26 @@ class Recorder(threading.Thread):
                 i += 1
                 continue
 
-            # Merge continuous text input into one "type" action.
+            # Merge continuous text input into one "type" action,
+            # or fold chorded input into a single hotkey step.
             if action == "key_input":
                 elapsed = event["time_stamp"] - first_ts
+                if _chord_qualifies(held_canon_set()):
+                    main_key = _main_key_from_input_text(event.get("text"))
+                    if main_key:
+                        emit_hotkey(
+                            main_key,
+                            elapsed,
+                            event.get("observation"),
+                            event.get("objects"),
+                        )
+                        i += 1
+                        continue
+                # Shift (+ nothing chord-worthy) while typing: treat as normal text,
+                # and suppress later keyDown/keyUp for shift used only for capitalization.
+                for canon, info in held_modifiers.items():
+                    if canon == "shift" and not info.get("consumed_hotkey"):
+                        info["typing_assist"] = True
                 if typing_start_elapsed is None:
                     typing_start_elapsed = elapsed
                     typing_observation = event.get("observation")
@@ -604,12 +912,97 @@ class Recorder(threading.Thread):
                     isinstance(key_name, str)
                     and len(key_name) == 1
                     and typing_start_elapsed is not None
+                    and not _is_modifier_key(key_name)
                 ):
+                    i += 1
+                    continue
+
+            # Modifier press: defer keyDown until we know if this is a hotkey,
+            # typing-assist (Shift+letter), or a real standalone modifier.
+            if action == "press" and _is_modifier_key(event.get("name")):
+                flush_typing_buffer()
+                canon = _canonical_key_name(event.get("name"))
+                if canon:
+                    held_modifiers[canon] = {
+                        "raw_name": event.get("name"),
+                        "emitted_down": False,
+                        "consumed_hotkey": False,
+                        "typing_assist": False,
+                        "observation": event.get("observation"),
+                        "objects": event.get("objects"),
+                    }
+                i += 1
+                continue
+
+            if action == "release" and _is_modifier_key(event.get("name")):
+                canon = _canonical_key_name(event.get("name"))
+                info = held_modifiers.pop(canon, None) if canon else None
+                elapsed = event["time_stamp"] - first_ts
+                if info is None:
+                    i += 1
+                    continue
+                if info.get("consumed_hotkey") or info.get("typing_assist"):
+                    i += 1
+                    continue
+                flush_typing_buffer()
+                if not info.get("emitted_down"):
+                    append_real_action(
+                        "keyDown",
+                        {"key": info.get("raw_name") or canon},
+                        elapsed,
+                        info.get("observation"),
+                        info.get("objects"),
+                    )
+                append_real_action(
+                    "keyUp",
+                    {"key": info.get("raw_name") or event.get("name")},
+                    elapsed,
+                    event.get("observation"),
+                    event.get("objects"),
+                )
+                i += 1
+                continue
+
+            # Non-modifier key press while a chord is held -> hotkey.
+            if action == "press" and not _is_modifier_key(event.get("name")):
+                elapsed = event["time_stamp"] - first_ts
+                main_key = _canonical_key_name(event.get("name"))
+                if main_key and _chord_qualifies(held_canon_set()):
+                    emit_hotkey(
+                        main_key,
+                        elapsed,
+                        event.get("observation"),
+                        event.get("objects"),
+                    )
+                    skip_main_key_releases.add(main_key)
+                    # Also skip raw-name variants (e.g. release still named 'a').
+                    raw = event.get("name")
+                    if isinstance(raw, str):
+                        skip_main_key_releases.add(raw.lower())
+                    i += 1
+                    continue
+
+            if action == "release" and not _is_modifier_key(event.get("name")):
+                raw = event.get("name")
+                canon = _canonical_key_name(raw)
+                raw_l = str(raw).lower() if raw is not None else ""
+                if (canon and canon in skip_main_key_releases) or raw_l in skip_main_key_releases:
+                    if canon:
+                        skip_main_key_releases.discard(canon)
+                    skip_main_key_releases.discard(raw_l)
                     i += 1
                     continue
 
             # Any non-typing event flushes current text buffer first.
             flush_typing_buffer()
+            elapsed = event["time_stamp"] - first_ts
+            # Surface deferred modifier downs before pointer/scroll/keys so that
+            # Ctrl+Click stays keyDown -> click -> keyUp, and Shift+Enter keeps order.
+            ensure_modifier_downs_emitted(
+                elapsed,
+                event.get("observation"),
+                event.get("objects"),
+            )
 
             if action == "scroll":
                 first_event = event
@@ -669,6 +1062,21 @@ class Recorder(threading.Thread):
                     event.get("objects"),
                 )
                 record_click_export(elapsed, nx, ny, "left")
+            elif action == "hover":
+                append_real_action(
+                    "hover",
+                    {
+                        "x": norm_x(event["x"]),
+                        "y": norm_y(event["y"]),
+                        "screen_x": event["x"],
+                        "screen_y": event["y"],
+                        "monitor_id": monitor_for(event["x"], event["y"]),
+                        "duration": float(event.get("duration") or 0.0),
+                    },
+                    elapsed,
+                    event.get("observation"),
+                    event.get("objects"),
+                )
             elif action == "right_click":
                 nx = norm_x(event["x"])
                 ny = norm_y(event["y"])
@@ -791,6 +1199,7 @@ class Recorder(threading.Thread):
             i += 1
 
         flush_typing_buffer()
+        # Drop any modifiers still held at end of events without emitting noise.
 
         # If we saw a drag_start but never captured drag_end,
         # still emit a dragTo step by treating the end == start.
@@ -927,6 +1336,7 @@ class Recorder(threading.Thread):
     def pause_recording(self):
         if not self._is_paused and self._is_recording:
             self._is_paused = True
+            self._reset_hover_tracking()
             self.adaptive_capture.pause()
             self.capture_client.pause_recording()
             self._enqueue_event({
@@ -937,6 +1347,7 @@ class Recorder(threading.Thread):
     def resume_recording(self):
         if self._is_paused and self._is_recording:
             self._is_paused = False
+            self._reset_hover_tracking()
             self.adaptive_capture.resume()
             self.capture_client.resume_recording()
             self._enqueue_event({

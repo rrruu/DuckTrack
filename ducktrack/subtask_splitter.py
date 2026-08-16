@@ -365,6 +365,8 @@ class SubtaskSplitter:
         n = (name or "").lower()
         if n in {"click", "leftclick", "left_click", "rightclick", "right_click", "doubleclick", "double_click"}:
             return "pointer"
+        if n in {"hover", "moveto", "move_to"}:
+            return "pointer"
         if n in {"type", "type_text", "typing"}:
             return "type"
         if n in {"scroll", "wheel"}:
