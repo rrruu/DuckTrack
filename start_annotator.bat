@@ -30,18 +30,18 @@ if exist "%VENV_PY%" (
   set "DUCKTRACK_BACKEND_PYTHON=%VENV_PY%"
 )
 set "DUCKTRACK_CLOUD_URL=http://118.145.32.133:20027"
-set "DUCKTRACK_CLOUD_TOKEN=cff31b749e096805bf2efd84f489a65d93bedf7fc93daead1c35f668eef23488"
+set "DUCKTRACK_CLOUD_TOKEN=your-cloud-token-here"
 set "DUCKTRACK_CAPTURE_POLL_FPS=0.5"
 set "DUCKTRACK_CONTINUOUS_VIDEO=0"
 set "DUCKTRACK_OA_ENABLED=0"
 
-set "DUCKTRACK_QWEN_URL=https://api.xxx.com/v1/chat/completions"
-set "DUCKTRACK_QWEN_TOKEN=sk-xxx"
-set "DUCKTRACK_QWEN_MODEL=Qwen/Qwen3.6-27B"
+set "DUCKTRACK_QWEN_URL=https://openrouter.ai/api/v1/chat/completions"
+set "DUCKTRACK_QWEN_TOKEN=your-openrouter-key-here"
+set "DUCKTRACK_QWEN_MODEL=anthropic/claude-sonnet-4"
 set "DUCKTRACK_QWEN_ENABLE_THINKING=0"
 set "DUCKTRACK_QWEN_MAX_TOKENS=4096"
 rem Feature-2 v2: VL model for sub-task split (can differ from step annotator model)
-set "DUCKTRACK_SUBTASK_MODEL=Qwen/Qwen3-VL-32B-Instruct"
+set "DUCKTRACK_SUBTASK_MODEL=anthropic/claude-sonnet-4"
 set "DUCKTRACK_SUBTASK_MAX_IMAGES=12"
 set "DUCKTRACK_SUBTASK_VISION=1"
 set "DUCKTRACK_SUBTASK_FALLBACK_TEXT=1"

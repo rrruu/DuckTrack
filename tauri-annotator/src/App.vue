@@ -916,11 +916,13 @@ async function runModelSplitSubtasks() {
     selectedViewIndex.value = 0;
     const visionMeta = updated?.sub_task_metadata || {};
     const modeHint =
-      visionMeta.prompt_version === "subtask-split-v2"
-        ? "（看图划分 v2）"
-        : visionMeta.prompt_version === "subtask-split-v1"
-          ? "（文本划分 v1）"
-          : "";
+      visionMeta.prompt_version === "subtask-split-v3"
+        ? "（长轨粗切+细切 v4）"
+        : visionMeta.prompt_version === "subtask-split-v2"
+          ? "（看图划分 v2）"
+          : visionMeta.prompt_version === "subtask-split-v1"
+            ? "（文本划分 v1）"
+            : "";
     status.value = `模型划分完成：${(updated.sub_tasks || []).length} 个子任务${modeHint}（可撤销）`;
   } catch (e: any) {
     status.value = `模型划分失败：${e?.message || String(e)}`;
