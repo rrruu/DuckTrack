@@ -14,8 +14,16 @@ from pynput.keyboard import KeyCode
 
 from .adaptive_capture import AdaptiveScreenCapture
 from .capture_client import CaptureClient
+from .foreground_context import (
+    capture_foreground_context,
+    compute_primary_application,
+    pick_context_from_events,
+)
 from .metadata import MetadataManager
+from .provenance import assign_step_seqs, attach_step_provenance, env_enabled, new_event_id
 from .screen_video import ScreenVideoRecorder
+from .uia_context import get_last_error as get_uia_last_error
+from .uia_context import maybe_attach_uia_to_event
 from .subtask_schema import build_covering_sub_tasks, last_actionable_step_index, new_sub_task_id
 from .util import fix_windows_dpi_scaling, get_recordings_dir
 
@@ -124,6 +132,13 @@ class Recorder(threading.Thread):
         self._is_recording = False
         self._is_paused = False
         self._step_counter = 0
+        self._event_seq_counter = 0
+        self._event_ids_enabled = env_enabled("DUCKTRACK_EVENT_IDS", True)
+        self._step_ids_enabled = env_enabled("DUCKTRACK_STEP_IDS", True)
+        self._provenance_enabled = env_enabled("DUCKTRACK_PROVENANCE_JSON", True)
+        self._foreground_context_enabled = env_enabled("DUCKTRACK_FOREGROUND_CONTEXT", True)
+        self._context_exe_path_enabled = env_enabled("DUCKTRACK_CONTEXT_EXE_PATH", False)
+        self._uia_enabled = env_enabled("DUCKTRACK_UIA", False)
         self.last_error = None
         self._finalize_lock = threading.Lock()
         self._finalize_started = False
@@ -540,7 +555,35 @@ class Recorder(threading.Thread):
             except Exception:
                 pass
 
+    def _maybe_attach_foreground_context(self, event: dict):
+        """Attach foreground window context (v5-B); skip drag_move / drop stats."""
+        if not self._foreground_context_enabled:
+            return
+        if event.get("context"):
+            return
+        action = event.get("action")
+        if action in {"drag_move", "recorder_drop_stats"}:
+            return
+        ctx = capture_foreground_context(
+            include_exe_path=self._context_exe_path_enabled,
+            monitors=self.metadata_manager.metadata.get("monitors") or [],
+        )
+        if ctx:
+            event["context"] = ctx
+
+    def _maybe_attach_uia(self, event: dict):
+        """Attach context.uia for click-like actions when DUCKTRACK_UIA=1."""
+        maybe_attach_uia_to_event(event, enabled=self._uia_enabled)
+
     def _capture_step_artifacts(self, event: dict):
+        if self._event_ids_enabled and event.get("action") != "recorder_drop_stats":
+            event["event_id"] = new_event_id()
+            event["event_seq"] = self._event_seq_counter
+            self._event_seq_counter += 1
+
+        self._maybe_attach_foreground_context(event)
+        self._maybe_attach_uia(event)
+
         step_idx = self._step_counter
         obj_image_filename = f"step_{step_idx}.png"
         step_filename = f"step_{step_idx}.json"
@@ -642,6 +685,20 @@ class Recorder(threading.Thread):
                 if self.adaptive_capture.last_error:
                     self.metadata_manager.metadata["adaptive_capture_error"] = self.adaptive_capture.last_error
                 self.metadata_manager.metadata["capture_mode"] = "adaptive_event_frames"
+                self.metadata_manager.metadata["recorder_features"] = {
+                    "event_ids": self._event_ids_enabled,
+                    "step_ids": self._step_ids_enabled,
+                    "provenance": self._provenance_enabled,
+                    "foreground_context": self._foreground_context_enabled,
+                    "context_exe_path": self._context_exe_path_enabled,
+                    "uia": self._uia_enabled,
+                }
+                if self._uia_enabled:
+                    uia_err = get_uia_last_error()
+                    if uia_err:
+                        self.metadata_manager.metadata["uia_last_error"] = uia_err
+                if self._foreground_context_enabled or self._uia_enabled:
+                    self.metadata_manager.metadata["schema_version"] = "ducktrack-metadata-v5"
                 if self._continuous_video_enabled and self.screen_video_recorder.last_error:
                     self.metadata_manager.metadata["screen_video_error"] = self.screen_video_recorder.last_error
                 elif self._continuous_video_enabled:
@@ -701,8 +758,17 @@ class Recorder(threading.Thread):
                     return monitor["id"]
             return None
 
-        def build_step(step_idx, action_name, params, elapsed, observation=None, objects=None):
-            return {
+        def build_step(
+            step_idx,
+            action_name,
+            params,
+            elapsed,
+            observation=None,
+            objects=None,
+            merge_rule="direct",
+            source_events=None,
+        ):
+            step = {
                 "observation": observation,
                 "screenshot_caption": None,
                 "rationale": None,
@@ -715,10 +781,22 @@ class Recorder(threading.Thread):
                 "frames": frames_by_observation.get(observation),
                 "reference_idx": None,
             }
+            attach_step_provenance(
+                step,
+                merge_rule=merge_rule,
+                source_events=source_events,
+                enabled=self._step_ids_enabled,
+            )
+            if self._foreground_context_enabled or self._uia_enabled:
+                ctx = pick_context_from_events(source_events)
+                if ctx:
+                    step["context"] = ctx
+            return step
 
         trajectory = []
         pending_drag = None
         pending_drag_points = None
+        pending_drag_events: list[dict] = []
         # Timeline after the last committed step (same time base as elapsed_time).
         # Insert 1s wait steps only when the next real action is more than 1s later,
         # advancing the cursor second-by-second so waits never "overlap" real actions.
@@ -729,13 +807,30 @@ class Recorder(threading.Thread):
         typing_start_elapsed = None
         typing_observation = None
         typing_objects = None
+        typing_source_events: list[dict] = []
         # Deferred modifier state for hotkey merging.
         # Shift alone never forms a hotkey; ctrl/alt/win (+ optional shift) does.
         held_modifiers: dict[str, dict] = {}
         skip_main_key_releases: set[str] = set()
+        pending_hotkey: dict | None = None
 
         # Suppress accidental double-releases logged as two very close clicks at ~same spot.
         _last_click_export = None  # (elapsed, nx, ny, kind)
+
+        def flush_pending_hotkey():
+            nonlocal pending_hotkey
+            if pending_hotkey is None:
+                return
+            append_real_action(
+                "hotkey",
+                {"keys": pending_hotkey["keys"]},
+                pending_hotkey["elapsed"],
+                pending_hotkey.get("observation"),
+                pending_hotkey.get("objects"),
+                merge_rule="hotkey_chord",
+                source_events=pending_hotkey.get("source_events") or [],
+            )
+            pending_hotkey = None
 
         def append_real_action(
             action_name,
@@ -743,6 +838,8 @@ class Recorder(threading.Thread):
             elapsed,
             observation=None,
             objects=None,
+            merge_rule="direct",
+            source_events=None,
         ):
             nonlocal timeline_end, last_real_observation, last_real_objects
             el = float(elapsed)
@@ -760,6 +857,8 @@ class Recorder(threading.Thread):
                             round(wtime, 3),
                             last_real_observation,
                             last_real_objects,
+                            merge_rule="direct",
+                            source_events=[],
                         )
                     )
                     timeline_end = wtime
@@ -771,6 +870,8 @@ class Recorder(threading.Thread):
                     round(el, 3),
                     observation,
                     objects,
+                    merge_rule=merge_rule,
+                    source_events=source_events,
                 )
             )
             timeline_end = el
@@ -779,6 +880,7 @@ class Recorder(threading.Thread):
 
         def flush_typing_buffer():
             nonlocal typing_buffer, typing_start_elapsed, typing_observation, typing_objects
+            nonlocal typing_source_events
             if typing_buffer and typing_start_elapsed is not None:
                 append_real_action(
                     "type",
@@ -786,11 +888,14 @@ class Recorder(threading.Thread):
                     typing_start_elapsed,
                     typing_observation,
                     typing_objects,
+                    merge_rule="type_buffer",
+                    source_events=typing_source_events,
                 )
             typing_buffer = ""
             typing_start_elapsed = None
             typing_observation = None
             typing_objects = None
+            typing_source_events = []
 
         def held_canon_set() -> set[str]:
             return set(held_modifiers.keys())
@@ -808,22 +913,41 @@ class Recorder(threading.Thread):
                     elapsed,
                     observation if observation is not None else info.get("observation"),
                     objects if objects is not None else info.get("objects"),
+                    merge_rule="direct",
+                    source_events=[info["press_event"]] if info.get("press_event") else [],
                 )
                 info["emitted_down"] = True
 
-        def emit_hotkey(main_key: str, elapsed, observation=None, objects=None):
+        def emit_hotkey(main_key: str, elapsed, observation=None, objects=None, main_event=None):
+            nonlocal pending_hotkey
             flush_typing_buffer()
             keys = _ordered_hotkey_keys(held_canon_set(), main_key)
-            append_real_action(
-                "hotkey",
-                {"keys": keys},
-                elapsed,
-                observation,
-                objects,
+            source_events: list[dict] = []
+            for m in _HOTKEY_MODIFIER_ORDER:
+                if m in held_modifiers and held_modifiers[m].get("press_event"):
+                    source_events.append(held_modifiers[m]["press_event"])
+            for m, info in held_modifiers.items():
+                if m not in _HOTKEY_MODIFIER_ORDER and info.get("press_event"):
+                    source_events.append(info["press_event"])
+            if main_event is not None:
+                source_events.append(main_event)
+            releases_expected = sum(
+                1 for info in held_modifiers.values() if info.get("press_event")
             )
+            pending_hotkey = {
+                "keys": keys,
+                "elapsed": elapsed,
+                "observation": observation,
+                "objects": objects,
+                "source_events": source_events,
+                "releases_expected": releases_expected,
+                "releases_seen": 0,
+            }
             for info in held_modifiers.values():
                 info["consumed_hotkey"] = True
                 info["typing_assist"] = False
+            if releases_expected == 0:
+                flush_pending_hotkey()
 
         def should_skip_spurious_click(elapsed, nx, ny, kind: str) -> bool:
             nonlocal _last_click_export
@@ -889,6 +1013,7 @@ class Recorder(threading.Thread):
                             elapsed,
                             event.get("observation"),
                             event.get("objects"),
+                            main_event=event,
                         )
                         i += 1
                         continue
@@ -902,6 +1027,7 @@ class Recorder(threading.Thread):
                     typing_observation = event.get("observation")
                     typing_objects = event.get("objects")
                 typing_buffer += event.get("text", "")
+                typing_source_events.append(event)
                 i += 1
                 continue
 
@@ -930,6 +1056,7 @@ class Recorder(threading.Thread):
                         "typing_assist": False,
                         "observation": event.get("observation"),
                         "objects": event.get("objects"),
+                        "press_event": event,
                     }
                 i += 1
                 continue
@@ -941,7 +1068,15 @@ class Recorder(threading.Thread):
                 if info is None:
                     i += 1
                     continue
-                if info.get("consumed_hotkey") or info.get("typing_assist"):
+                if info.get("consumed_hotkey"):
+                    if pending_hotkey is not None:
+                        pending_hotkey["source_events"].append(event)
+                        pending_hotkey["releases_seen"] += 1
+                        if pending_hotkey["releases_seen"] >= pending_hotkey["releases_expected"]:
+                            flush_pending_hotkey()
+                    i += 1
+                    continue
+                if info.get("typing_assist"):
                     i += 1
                     continue
                 flush_typing_buffer()
@@ -952,6 +1087,8 @@ class Recorder(threading.Thread):
                         elapsed,
                         info.get("observation"),
                         info.get("objects"),
+                        merge_rule="direct",
+                        source_events=[info["press_event"]] if info.get("press_event") else [],
                     )
                 append_real_action(
                     "keyUp",
@@ -959,6 +1096,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
                 i += 1
                 continue
@@ -973,6 +1112,7 @@ class Recorder(threading.Thread):
                         elapsed,
                         event.get("observation"),
                         event.get("objects"),
+                        main_event=event,
                     )
                     skip_main_key_releases.add(main_key)
                     # Also skip raw-name variants (e.g. release still named 'a').
@@ -1020,6 +1160,7 @@ class Recorder(threading.Thread):
                     last_event = events[j]
                     j += 1
 
+                scroll_events = events[i:j]
                 elapsed = first_event["time_stamp"] - first_ts
                 append_real_action(
                     "scroll",
@@ -1036,6 +1177,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     first_event.get("observation"),
                     first_event.get("objects"),
+                    merge_rule="scroll_group" if len(scroll_events) > 1 else "direct",
+                    source_events=scroll_events,
                 )
                 i = j
                 continue
@@ -1060,6 +1203,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
                 record_click_export(elapsed, nx, ny, "left")
             elif action == "hover":
@@ -1076,6 +1221,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="hover_finalize",
+                    source_events=[event],
                 )
             elif action == "right_click":
                 nx = norm_x(event["x"])
@@ -1095,6 +1242,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
                 record_click_export(elapsed, nx, ny, "right")
             elif action == "double_left_click":
@@ -1110,6 +1259,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
             elif action == "double_right_click":
                 append_real_action(
@@ -1124,9 +1275,12 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
             elif action == "drag_start":
                 pending_drag = event
+                pending_drag_events = [event]
                 pending_drag_points = [
                     {
                         "x": norm_x(pending_drag.get("start_x", pending_drag.get("x", 0))),
@@ -1136,11 +1290,13 @@ class Recorder(threading.Thread):
             elif action == "drag_move" and pending_drag is not None:
                 if pending_drag_points is None:
                     pending_drag_points = []
+                pending_drag_events.append(event)
                 pending_drag_points.append({
                     "x": norm_x(event.get("x", pending_drag.get("x", 0))),
                     "y": norm_y(event.get("y", pending_drag.get("y", 0))),
                 })
             elif action == "drag_end" and pending_drag is not None:
+                pending_drag_events.append(event)
                 drag_path = pending_drag_points[:] if pending_drag_points else []
                 drag_path.append({
                     "x": norm_x(event.get("x", pending_drag.get("x", 0))),
@@ -1168,9 +1324,12 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation") or pending_drag.get("observation"),
                     event.get("objects") or pending_drag.get("objects"),
+                    merge_rule="drag_compose",
+                    source_events=pending_drag_events,
                 )
                 pending_drag = None
                 pending_drag_points = None
+                pending_drag_events = []
             elif action == "press":
                 append_real_action(
                     "keyDown",
@@ -1178,6 +1337,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
             elif action == "release":
                 append_real_action(
@@ -1186,6 +1347,8 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
             elif action in ["pause", "resume"]:
                 append_real_action(
@@ -1194,11 +1357,14 @@ class Recorder(threading.Thread):
                     elapsed,
                     event.get("observation"),
                     event.get("objects"),
+                    merge_rule="direct",
+                    source_events=[event],
                 )
 
             i += 1
 
         flush_typing_buffer()
+        flush_pending_hotkey()
         # Drop any modifiers still held at end of events without emitting noise.
 
         # If we saw a drag_start but never captured drag_end,
@@ -1225,6 +1391,8 @@ class Recorder(threading.Thread):
                 pending_drag["time_stamp"] - first_ts,
                 pending_drag.get("observation"),
                 pending_drag.get("objects"),
+                merge_rule="drag_compose",
+                source_events=pending_drag_events or [pending_drag],
             )
 
         terminate_elapsed = float(events[-1]["time_stamp"] - first_ts) if events else 0.0
@@ -1258,6 +1426,8 @@ class Recorder(threading.Thread):
                 round(terminate_elapsed, 3),
                 terminate_observation,
                 terminate_objects,
+                merge_rule="terminate_append",
+                source_events=[],
             )
         )
 
@@ -1280,15 +1450,29 @@ class Recorder(threading.Thread):
             initial_id=self._initial_sub_task_id,
         )
 
-        app_name = "unknown"
+        host_name = "unknown"
         try:
-            app_name = platform.node() or "unknown"
+            host_name = platform.node() or "unknown"
         except Exception:
             pass
 
+        primary_application = compute_primary_application(trajectory)
+        # Compatibility: prefer primary process name; fall back to host_name for empty tracks.
+        application = (
+            (primary_application or {}).get("process_name")
+            or host_name
+        )
+
+        # Readable 0..N-1 step ordinals (same as array index / sub_tasks start_step).
+        assign_step_seqs(trajectory, enabled=self._step_ids_enabled)
+
         result = {
+            "schema_version": "ducktrack-trajectory-v5",
             "query": "",
-            "application": app_name,
+            "host_name": host_name,
+            "primary_application": primary_application,
+            # Deprecated: historically held hostname; now mirrors primary process when known.
+            "application": application,
             "platform_type": (self.metadata_manager.metadata.get("system", "unknown") or "unknown").lower(),
             "url": None,
             "sub_tasks": sub_tasks,
@@ -1299,6 +1483,27 @@ class Recorder(threading.Thread):
         trajectory_path = os.path.join(self.recording_path, "trajectory.json")
         with open(trajectory_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=4)
+
+        if self._provenance_enabled and self._step_ids_enabled:
+            provenance = {
+                "schema_version": "provenance-v1",
+                "recording_id": os.path.basename(self.recording_path.rstrip("\\/")),
+                "steps": [
+                    {
+                        "step_id": step.get("step_id"),
+                        "step_seq": step.get("step_seq", idx),
+                        # Alias kept for older readers; same value as step_seq.
+                        "step_index": step.get("step_seq", idx),
+                        "action_name": (step.get("action") or [{}])[0].get("name"),
+                        "merge_rule": step.get("merge_rule", "direct"),
+                        "source_event_ids": step.get("source_event_ids", []),
+                    }
+                    for idx, step in enumerate(trajectory)
+                ],
+            }
+            provenance_path = os.path.join(self.recording_path, "provenance.json")
+            with open(provenance_path, "w", encoding="utf-8") as f:
+                json.dump(provenance, f, ensure_ascii=False, indent=4)
 
     def mark_sub_task_boundary(self, instruction: str = ""):
         """Start a new sub-task segment from the next recorded actions."""

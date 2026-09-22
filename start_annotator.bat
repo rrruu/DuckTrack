@@ -29,11 +29,16 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-
 if exist "%VENV_PY%" (
   set "DUCKTRACK_BACKEND_PYTHON=%VENV_PY%"
 )
-set "DUCKTRACK_CLOUD_URL=http://118.145.32.133:20027"
+set "DUCKTRACK_CLOUD_URL="
 set "DUCKTRACK_CLOUD_TOKEN=your-cloud-token-here"
 set "DUCKTRACK_CAPTURE_POLL_FPS=0.5"
 set "DUCKTRACK_CONTINUOUS_VIDEO=0"
 set "DUCKTRACK_OA_ENABLED=0"
+rem v5 UI Automation (control-level context.uia on clicks). Default OFF.
+rem Set to 1 only when you need ElementFromPoint control info on click events.
+rem Requires: Windows + comtypes in .venv (pip install -r requirements-unified.txt).
+rem After changing this value, fully quit and relaunch this bat so the backend picks it up.
+set "DUCKTRACK_UIA=1"
 
 set "DUCKTRACK_QWEN_URL=https://openrouter.ai/api/v1/chat/completions"
 set "DUCKTRACK_QWEN_TOKEN=your-openrouter-key-here"

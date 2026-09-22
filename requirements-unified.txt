@@ -5,3 +5,4 @@ mss
 screeninfo
 fastapi
 uvicorn
+comtypes; platform_system=="Windows"
